@@ -1,0 +1,109 @@
+// Shared game rules + answer matching. Loaded by the browser (classic script) and
+// imported by the Worker (src/worker.js) so the server scores runs exactly like the client.
+(function (g) {
+"use strict";
+const TIERS = {
+  bubble:   { name: "Bubble",      depth: 50,  o2: 8,  icon: "🫧", blurb: "The first thing everyone blurts out." },
+  herring:  { name: "Red Herring", depth: 70,  o2: 6,  icon: "🐠", blurb: "The 'obscure' pick every diver thinks only they know." },
+  shoal:    { name: "Shoal",       depth: 150, o2: 14, icon: "🐟", blurb: "Solid. You swim with the shoal." },
+  twilight: { name: "Twilight",    depth: 300, o2: 22, icon: "🦑", blurb: "Genuinely uncommon. The light starts to fade." },
+  abyssal:  { name: "Abyssal",     depth: 450, o2: 30, icon: "🐙", blurb: "Very few divers make it down this far." },
+  pearl:    { name: "Black Pearl", depth: 600, o2: 50, icon: "🦪", blurb: "The hidden pearl of this prompt. Lungs refilled." },
+};
+const TIER_PRIORITY = ["pearl", "abyssal", "twilight", "shoal", "herring", "bubble"];
+const O2_MAX = 100;
+const GRACE_MS = 3000;          // free reading time per prompt
+const GRACE_TOUCH_MS = 5000;    // touch screens: the keyboard has to come up and phone typing is slower
+const graceMs = (touch) => (touch ? GRACE_TOUCH_MS : GRACE_MS);
+const WRONG_COST = 4;
+const SKIP_COST = 12;
+const REVIVE_O2 = 50;           // one free revive per device (bookmark the site)
+const drainPerSec = (depth) => 2.5 + depth / 2000;
+// Guaranteed thinking time: each prompt's drain rate is fixed when it appears, and is slowed
+// so whatever air you have lasts at least MIN_THINK_MS after the reading time (wrong answers still cost air).
+const MIN_THINK_MS = 8000;
+const roundRate = (depth, o2) => Math.min(drainPerSec(depth), Math.max(0, o2) / (MIN_THINK_MS / 1000));
+
+function norm(s) {
+  return String(s).toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .replace(/&/g, " and ").replace(/\+/g, " plus ").replace(/#/g, " sharp ").replace(/['’`.]/g, "").replace(/[^a-z0-9]+/g, " ").trim()
+    .replace(/^(the|a|an) /, "");
+}
+function lev(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i]; let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      rowMin = Math.min(rowMin, cur[j]);
+    }
+    if (rowMin > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+function buildIndex(p) {
+  if (p._idx) return p._idx;
+  const map = new Map(); const byTier = {};
+  for (const tier of TIER_PRIORITY) {
+    const raw = tier === "pearl" ? [p.t.pearl] : (p.t[tier] || []);
+    byTier[tier] = [];
+    for (const entry of raw) {
+      const names = entry.split("|"); const display = names[0];
+      byTier[tier].push(display);
+      for (const n of names) {
+        const k = norm(n);
+        for (const key of [k, k.replace(/ /g, "")]) if (key && !map.has(key)) map.set(key, { display, tier });
+      }
+    }
+  }
+  Object.defineProperty(p, "_idx", { value: { map, byTier }, enumerable: false });
+  return p._idx;
+}
+const Q_STOP = new Set(["name", "type", "kind", "famous", "something", "you", "find", "the", "that", "starts", "with", "ending", "and", "for"]);
+function catWords(p) {
+  if (!p._cat) Object.defineProperty(p, "_cat", { value: norm(p.q).split(" ").filter((w) => w.length >= 3 && !Q_STOP.has(w)), enumerable: false });
+  return p._cat;
+}
+function match(p, input) {
+  const { map } = buildIndex(p);
+  const n = norm(input);
+  if (!n) return null;
+  const tries = [n, n.replace(/ /g, "")];
+  if (n.endsWith("es")) tries.push(n.slice(0, -2));
+  if (n.endsWith("s")) tries.push(n.slice(0, -1));
+  for (const t of tries) if (map.has(t)) return map.get(t);
+  // Bare qualifier + the prompt's category word: "granny" -> Granny Knot, "blue" -> Blue Cheese,
+  // "red" -> Red Sea, "kansas" -> Kansas City. Only exact hits on an existing answer.
+  for (const w of catWords(p)) for (const t of [n + " " + w, n + w]) if (map.has(t)) return map.get(t);
+  // Qualified names: "red maple" -> Maple (head noun), "Acer rubrum" -> Acer (genus alias).
+  // Exact word hits only, and only for words long enough to mean something.
+  const words = n.split(" ");
+  if (words.length > 1) {
+    const last = words[words.length - 1];
+    for (const w of [last, last.replace(/s$/, ""), last.replace(/es$/, ""), words[0]]) if (w.length >= 3 && map.has(w)) return map.get(w);
+  }
+  // Two neighbouring letters swapped ("zues" -> Zeus): one slip, even in short words.
+  if (n.length >= 4) for (const t of [n, tries[1]]) for (let i = 0; i < t.length - 1; i++) {
+    if (t[i] === t[i + 1] || t[i] === " " || t[i + 1] === " ") continue;
+    const sw = t.slice(0, i) + t[i + 1] + t[i] + t.slice(i + 2);
+    if (map.has(sw)) return map.get(sw);
+  }
+  const max = n.length >= 8 ? 2 : n.length >= 5 ? 1 : 0;
+  if (!max) return null;
+  let best = null, bestD = max + 1;
+  // Also try without spaces ("mc beth" -> macbeth), since keys are indexed both ways.
+  const cands = tries[1] !== n ? [n, tries[1]] : [n];
+  for (const [k, v] of map) {
+    for (const c of cands) {
+      const d = lev(c, k, max);
+      if (d < bestD) { bestD = d; best = v; }
+    }
+    if (bestD === 1 && max === 1) break;
+  }
+  return best;
+}
+
+g.KEngine = { TIERS, TIER_PRIORITY, O2_MAX, GRACE_MS, GRACE_TOUCH_MS, graceMs, WRONG_COST, SKIP_COST, REVIVE_O2, MIN_THINK_MS, drainPerSec, roundRate, norm, lev, buildIndex, match };
+})(typeof window !== "undefined" ? window : globalThis);

@@ -1,0 +1,1682 @@
+(() => {
+"use strict";
+const $ = (s) => document.querySelector(s);
+const { TIERS, O2_MAX, graceMs, WRONG_COST, SKIP_COST, REVIVE_O2, roundRate, buildIndex, match, norm } = window.KEngine;
+// Touch screens get a longer free reading time (keyboard + thumb typing); the server replays with the same flag.
+const TOUCH = matchMedia("(pointer: coarse)").matches;
+const GRACE_MS = graceMs(TOUCH);
+
+// Depth markers: zones, facts, creatures to log.
+const MARKERS = [
+  { d: 0,     creature: ["Sardine", "🐟", "Shoals of millions flash silver near the surface."] },
+  { d: 10,    fact: "Red light is already gone. Everything looks blue-green." },
+  { d: 60,    creature: ["Green sea turtle", "🐢", "Can rest underwater for hours on one breath."] },
+  { d: 200,   zone: "TWILIGHT ZONE", fact: "Too dark for photosynthesis below here." },
+  { d: 300,   creature: ["Swordfish", "🗡️", "Heats its own eyes to see in the cold dark."] },
+  { d: 500,   creature: ["Lanternfish", "🏮", "Rises hundreds of metres every night to feed. Hi."] },
+  { d: 700,   creature: ["Hatchetfish", "🪓", "Belly lights erase its silhouette from below."] },
+  { d: 1000,  zone: "MIDNIGHT ZONE", fact: "No sunlight at all from here down.", creature: ["Vampire squid", "🧛", "Neither vampire nor squid. Eats marine snow."] },
+  { d: 1500,  creature: ["Anglerfish", "🎣", "Its lure glows with bacteria living inside it."] },
+  { d: 2000,  creature: ["Giant squid", "🦑", "Eyes the size of dinner plates."] },
+  { d: 2250,  fact: "Sperm whales have been tracked hunting this deep." },
+  { d: 2500,  creature: ["Yeti crab", "🦀", "Farms bacteria on its hairy arms near hot vents."] },
+  { d: 3000,  creature: ["Gulper eel", "🐍", "Mouth far bigger than the rest of it."] },
+  { d: 3700,  fact: "You've passed the average depth of the ocean." },
+  { d: 4000,  zone: "ABYSSAL ZONE", fact: "Pressure here: ~400 atmospheres.", creature: ["Dumbo octopus", "🐙", "Flaps ear-like fins to hover over the seafloor."] },
+  { d: 4800,  creature: ["Tripod fish", "🦵", "Stands on three stilt fins, facing the current."] },
+  { d: 5500,  creature: ["Sea pig", "🐷", "A sea cucumber that walks on tube feet."] },
+  { d: 6000,  zone: "HADAL ZONE", fact: "The trenches begin. Water hovers near 1–4°C." },
+  { d: 7000,  creature: ["Hadal amphipod", "🦐", "Shrimp-like scavengers that swarm any bait."] },
+  { d: 8000,  creature: ["Mariana snailfish", "🐡", "The deepest fish ever filmed, near 8,300m."] },
+  { d: 10600, creature: ["Xenophyophore", "🫧", "A single cell the size of a fist."] },
+  { d: 10935, zone: "CHALLENGER DEEP", fact: "Bottom of the Mariana Trench. Ocean: complete." },
+  { d: 12262, fact: "Deeper than the Kola Superdeep Borehole. You're in the rock now." },
+  { d: 15000, creature: ["Something", "👁️", "It noticed you first."] },
+  { d: 20000, fact: "Still sinking. The lanternfish has questions." },
+  { d: 35000, zone: "THE MANTLE", fact: "The crust ends around here. It's getting warm." },
+];
+const ZONES = [[0, "SUNLIGHT ZONE"], [200, "TWILIGHT ZONE"], [1000, "MIDNIGHT ZONE"], [4000, "ABYSSAL ZONE"], [6000, "HADAL ZONE"], [10935, "BELOW THE TRENCH"], [35000, "THE MANTLE"]];
+const zoneFor = (d) => ZONES.filter(([z]) => d >= z).pop()[1];
+// background color keyframes by depth (surface matches the dusk sea under the sky scene)
+const BG = [[0, [28, 92, 148]], [100, [20, 72, 122]], [300, [13, 48, 86]], [1000, [6, 23, 44]], [2500, [3, 11, 22]], [5000, [1, 4, 9]], [9000, [0, 0, 0]]];
+
+// ---------- Analytics (best effort) ----------
+// Category pages (/geography, /animals, /food…) set <body data-cat>; dives there only draw that category's prompts
+// (or themed-mode prompts tagged with m: ["europe"] etc.).
+const CAT = document.body.dataset.cat || null;
+const BEST_KEY = CAT ? "best_" + CAT : "best";
+const track = (name, params) => { try { if (typeof window.gtag === "function") window.gtag("event", name, CAT ? { ...params, mode: CAT } : params || {}); } catch {} };
+
+// ---------- Storage (best effort) ----------
+const store = {
+  get(k, def) { try { const v = localStorage.getItem("ld_" + k); return v == null ? def : JSON.parse(v); } catch { return def; } },
+  set(k, v) { try { localStorage.setItem("ld_" + k, JSON.stringify(v)); } catch {} },
+};
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (c) => (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)));
+const IS_NEW = !store.get("pid", null);
+// Owner/test devices: open the site once with ?dev=1 (undo with ?dev=0). Their visits and dives are kept out of admin stats.
+try { const d = new URLSearchParams(location.search).get("dev"); if (d === "1") store.set("dev", 1); else if (d === "0") localStorage.removeItem("ld_dev"); } catch {}
+const DEV = store.get("dev", 0) ? 1 : 0;
+const PID = store.get("pid", null) || (() => { const id = uuid(); store.set("pid", id); return id; })();
+
+// ---------- Monitoring (best effort, never blocks the game) ----------
+const beacon = (path, body) => { try { const s = JSON.stringify(body); if (!(navigator.sendBeacon && navigator.sendBeacon("/api/" + path, s))) fetch("/api/" + path, { method: "POST", body: s, keepalive: true }).catch(() => {}); } catch {} };
+let errCount = 0;
+function reportError(msg, src, line, col, stack) {
+  if (errCount++ >= 5 || !msg || /^Script error\.?$/.test(msg)) return;   // cross-origin scripts (GTM) carry no detail
+  beacon("log", { pid: PID, msg: String(msg), src, line, col, stack: stack ? String(stack) : null, path: location.pathname });
+}
+addEventListener("error", (e) => reportError(e.message, e.filename, e.lineno, e.colno, e.error && e.error.stack));
+addEventListener("unhandledrejection", (e) => { const r = e.reason; reportError(r && r.message ? r.message : String(r), "promise", null, null, r && r.stack); });
+let visitId = null;
+const VISIT = (() => {
+  const q = new URLSearchParams(location.search);
+  return fetch("/api/visit", { method: "POST", headers: { "content-type": "application/json" }, keepalive: true, body: JSON.stringify({
+    pid: PID, is_new: IS_NEW, path: location.pathname, referrer: document.referrer || null, ref: q.get("ref"),
+    utm_source: q.get("utm_source"), utm_medium: q.get("utm_medium"), utm_campaign: q.get("utm_campaign"), lang: navigator.language, dev: DEV,
+  }) }).then((r) => r.json()).then((r) => (visitId = r.id || null)).catch(() => null);
+})();
+
+// ---------- API (best effort: the game works fully offline) ----------
+async function api(path, body) {
+  const res = await fetch("/api/" + path, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), keepalive: true } : {});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(data.error || "request failed"), { status: res.status });
+  return data;
+}
+async function pidHash() {
+  if (!(window.crypto && crypto.subtle)) return null;   // old browsers / insecure contexts
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(PID));
+  return [...new Uint8Array(buf)].slice(0, 12).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+let myHash = null;
+try { pidHash().then((h) => (myHash = h)).catch(() => {}); } catch {}
+
+// ---------- Question bank ----------
+// prompts.js is a big static file; if it failed to load (flaky network, school web filter) try once more
+// before letting anyone dive, instead of starting a dive that can never show a prompt.
+const promptsReady = () => Array.isArray(window.PROMPTS) && window.PROMPTS.length > 0;
+let promptsP = null;
+function ensurePrompts() {
+  if (promptsReady()) return Promise.resolve(true);
+  if (!promptsP) promptsP = new Promise((res) => {
+    const s = document.createElement("script");
+    s.src = "prompts.js?v=17&retry=" + Date.now();
+    s.onload = () => res(promptsReady());
+    s.onerror = () => res(false);
+    document.head.appendChild(s);
+  }).then((ok) => {
+    if (!ok) { promptsP = null; reportError("prompts.js failed to load", "prompts", null, null, null); }
+    return ok;
+  });
+  return promptsP;
+}
+if (!promptsReady()) ensurePrompts();
+
+// ---------- State ----------
+let S = null;
+let deck = [];
+// Warm-up prompts: almost everyone can answer these, so the first two of a dive come from here.
+const EASY = new Set(["Name a color", "Name a fruit", "Name a vegetable", "Name a mammal", "Name a sport", "Name a breed of dog",
+  "Name a musical instrument", "Name a country in Europe", "Name a dessert", "Name a pizza topping", "Name an item of clothing",
+  "Name a piece of furniture", "Name a job", "Name a sea creature", "Name an insect", "Name a bird", "Name a flower", "Name a geometric shape"]);
+const EASY_ROUNDS = 2;
+// Answer pages link to /?p=<slug> ("Play this prompt"): the first dive opens with that prompt. Same slug rule as tools/build-answer-pages.js.
+const promptSlug = (q) => q.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+let startSlug = (() => { try { return new URLSearchParams(location.search).get("p"); } catch { return null; } })();
+function drawPrompt() {
+  // Prompts marked x: 1 are mode-only (e.g. Fire-type Pokémon): they never show up in the full dive.
+  const P = CAT ? window.PROMPTS.filter((p) => p.c === CAT || (p.m || []).includes(CAT)) : window.PROMPTS.filter((p) => !p.x);
+  if (!deck.length) {
+    deck = P.map((_, i) => i);
+    for (let i = deck.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [deck[i], deck[j]] = [deck[j], deck[i]]; }
+  }
+  if (startSlug) {
+    const i = P.findIndex((p) => promptSlug(p.q) === startSlug);
+    startSlug = null;
+    if (i >= 0) {
+      if (deck.includes(i)) deck.splice(deck.indexOf(i), 1);
+      track("prompt_link", { prompt: P[i].q });
+      return P[i];
+    }
+  }
+  if (S && S.round <= EASY_ROUNDS) {
+    const used = new Set(S.log.map((g) => g.q));
+    let k = -1;
+    for (let i = deck.length - 1; i >= 0; i--) if (EASY.has(P[deck[i]].q) && !used.has(P[deck[i]].q)) { k = i; break; }
+    if (k >= 0) return P[deck.splice(k, 1)[0]];
+    const easy = P.filter((p) => EASY.has(p.q) && !used.has(p.q));
+    if (easy.length) return easy[Math.floor(Math.random() * easy.length)];
+  }
+  return P[deck.pop()];
+}
+
+function show(id) {
+  document.querySelectorAll(".screen").forEach((s) => s.classList.toggle("active", s.id === "screen-" + id));
+  const inRun = id === "ask" || id === "sink";
+  $("#hud").hidden = !inRun && id !== "over";
+  $("#gauge").hidden = !inRun && id !== "over";
+  document.body.classList.toggle("in-run", inRun);
+  document.body.classList.toggle("on-title", id === "title");
+  document.body.classList.toggle("on-sink", id === "sink");
+  if (id !== "title") scrollTo(0, 0);
+}
+
+function startRun() {
+  S = { depth: 0, shownDepth: 0, o2: O2_MAX, round: 0, state: "ask", history: [], askedAt: 0, prompt: null, log: [], runId: null, startP: null };
+  // Never wait on the visit ping: the server times the dive from run/start.
+  S.startP = api("run/start", { pid: PID, visit: visitId, dev: DEV }).then((r) => (S && (S.runId = r.id), r.id)).catch(() => null);
+  loadRivals();
+  scene.reset();
+  passMarkers(-1, 0, true);
+  track("dive_start", { dives_before: store.get("runs", 0) });
+  nextPrompt();
+}
+
+function nextPrompt() {
+  S.round++;
+  S.prompt = drawPrompt();
+  S.state = "ask";
+  S.rate = roundRate(S.depth, S.o2);   // fixed for this prompt; the server replays the same rule
+  S.askedAt = performance.now();
+  $("#askKicker").textContent = `PROMPT ${S.round} · ${zoneFor(S.depth)}`;
+  $("#askQ").textContent = S.prompt.q;
+  $("#answer").value = "";
+  $("#feedback").textContent = "";
+  S.wrongs = 0; S.nudge = null;
+  $("#skipBtn").classList.remove("pulse");
+  renderPips();
+  show("ask");
+  $("#answer").focus();
+}
+const logEvent = (k, input, at) => S.log.push({ r: S.round, q: S.prompt.q, i: input == null ? null : input.slice(0, 60), ms: Math.round((at || performance.now()) - S.askedAt), k });
+
+function submitAnswer(text) {
+  if (S.state !== "ask") return;
+  if (!text.trim()) return;
+  logEvent("a", text.trim());
+  const m = match(S.prompt, text);
+  // Same prompt again later in the dive: an answer already used for it doesn't score twice (no air lost either).
+  if (m && S.history.some((h) => h.q === S.prompt.q && h.a === m.display)) {
+    $("#feedback").textContent = `You already used "${m.display}" on this prompt. Try another.`;
+    $("#answer").select();
+    return;
+  }
+  if (!m) {
+    S.o2 = Math.max(0, S.o2 - WRONG_COST);
+    S.wrongs = (S.wrongs || 0) + 1;
+    const why = wrongWhy(S.prompt, text);
+    const nudge = S.wrongs >= 2 ? stuckNudge(S.prompt) : "";
+    $("#feedback").innerHTML = `“${esc(text.trim())}” ${why || "isn't in our charts"} <span class="cost">−${WRONG_COST} O₂</span>` +
+      (nudge ? `<span class="nudge">${nudge}</span>` : "");
+    if (S.wrongs >= 3) $("#skipBtn").classList.add("pulse");
+    const f = $("#answerForm"); f.classList.remove("shake"); void f.offsetWidth; f.classList.add("shake");
+    $("#answer").select();
+    if (S.o2 <= 0) endRun(true);
+    return;
+  }
+  resolve(m.tier, m.display);
+}
+
+// Wrong answers: say why when we can tell (wrong prompt, too general), and after two misses on the same prompt
+// hand out the first letters of a real answer, so a stuck diver has something to try instead of leaving.
+function wrongWhy(p, text) {
+  const n = norm(text);
+  if (!n) return null;
+  const qWords = norm(p.q).split(" ");
+  if (qWords.includes(n) || qWords.includes(n.replace(/s$/, ""))) return "is too general. Name a specific one";
+  for (const o of window.PROMPTS) if (o !== p && buildIndex(o).map.has(n)) return `fits “${esc(o.q)}”, not this one`;
+  return null;
+}
+function stuckNudge(p) {
+  if (!S.nudge) {
+    const { byTier } = buildIndex(p);
+    const used = new Set(S.history.filter((h) => h.q === p.q).map((h) => h.a));
+    const pool = [...(byTier.shoal || []), ...(byTier.bubble || [])].filter((a) => !used.has(a) && a.length > 3);
+    if (!pool.length) return "";
+    const a = pool[Math.floor(Math.random() * pool.length)];
+    S.nudge = `Stuck? Try one starting with <b>${esc(a.slice(0, 2))}…</b>`;
+  }
+  return S.nudge;
+}
+
+function resolve(tier, display) {
+  const T = TIERS[tier];
+  const before = S.depth;
+  S.depth += T.depth;
+  S.o2 = Math.min(O2_MAX, S.o2 + T.o2);
+  S.history.push({ q: S.prompt.q, p: S.prompt, a: display, tier });
+  S.state = "sink";
+  S.pending = { tier, display, before };
+  renderPips();
+  burst(T.depth);
+  sinkAnim(tier, display);
+}
+
+// ---------- Sink + reveal, one screen: the answer drifts down past each rarity line, stops at its tier,
+// and that line opens into the result. Deeper lines show what other divers found there.
+const SINK_ORDER = ["bubble", "herring", "shoal", "twilight", "abyssal", "pearl"];
+let sinkRaf = 0, sinkHold = 0;
+function sinkAnim(tier, display) {
+  const k = SINK_ORDER.indexOf(tier);
+  const sink = $("#sink"), lines = $("#sinkLines");
+  sink.className = "sink";
+  $("#screen-sink").classList.remove("revealed");
+  $("#sinkKicker").textContent = `PROMPT ${S.round}`;
+  $("#sinkQ").textContent = S.prompt.q;
+  lines.innerHTML = SINK_ORDER.map((t) =>
+    `<div class="s-row tier-${t}"><span class="s-ex"></span><span class="s-lbl">${TIERS[t].icon} ${TIERS[t].name.toUpperCase()} · +${TIERS[t].depth}m</span></div>`).join("") +
+    `<div class="sink-word"></div>`;
+  const rows = [...lines.querySelectorAll(".s-row")];
+  const w = lines.querySelector(".sink-word");
+  w.textContent = `“${display}”`;
+  const from = $("#answer").getBoundingClientRect();
+  show("sink");
+  // Launch: the word starts where it was typed and flies onto the top of the ladder, then falls.
+  const LAUNCH = reduceMotion ? 0 : 340;
+  if (LAUNCH && from.width) {
+    const to = w.getBoundingClientRect();
+    w.style.transition = "none";
+    w.style.translate = `${from.left + from.width / 2 - (to.left + to.width / 2)}px ${from.top + from.height / 2 - (to.top + to.height / 2)}px`;
+    w.style.scale = "1.15";
+    void w.offsetWidth;
+    w.style.transition = `translate ${LAUNCH}ms cubic-bezier(.3,.7,.4,1), scale ${LAUNCH}ms ease-out`;
+    w.style.translate = "0px 0px"; w.style.scale = "1";
+  }
+  const { before } = S.pending, gain = S.depth - before;
+  const target = rows[k].offsetTop, dur = reduceMotion ? 0 : 420 + 320 * (k + 1), t0 = performance.now() + LAUNCH;
+  (function step(now) {
+    if (now < t0) { sinkRaf = requestAnimationFrame(step); return; }
+    const t = dur ? Math.min(1, (now - t0) / dur) : 1;
+    const e = 1 - Math.pow(1 - t, 2.4);
+    const y = e * target;
+    w.style.top = y + "px";
+    S.shownDepth = before + gain * e;   // the world, HUD and gauge fall in step with the word
+    w.style.setProperty("--tilt", (-6 + Math.sin(now / 170) * 3 * (1 - t)) + "deg");
+    rows.forEach((el, i) => el.classList.toggle("passed", i < k && y >= el.offsetTop));
+    if (t < 1) { sinkRaf = requestAnimationFrame(step); return; }
+    land();
+    sinkHold = setTimeout(finishSink, reduceMotion ? 0 : 650);
+  })(t0);
+}
+// Pin the word onto its line (also used when the sink is skipped mid-fall).
+function land() {
+  const { tier } = S.pending, k = SINK_ORDER.indexOf(tier);
+  const rows = [...$("#sinkLines").querySelectorAll(".s-row")], w = $("#sinkLines .sink-word");
+  if (w.parentNode === rows[k]) return;
+  rows.forEach((el, i) => el.classList.toggle("passed", i < k));
+  rows[k].classList.add("hit");
+  rows[k].appendChild(w);            // rides along with its line when the ladder tightens
+  w.style.top = "0px";
+  w.style.removeProperty("--tilt");
+  w.style.transition = ""; w.style.translate = ""; w.style.scale = "";
+  w.classList.add("landed", "tier-" + tier);
+  S.shownDepth = S.depth;
+  impact(tier, rows[k], w);
+}
+
+// ---------- Impact: the moment the answer hits its line. Every tier gets one; rarer hits harder. ----------
+const IMPACT = {
+  bubble:   { tint: .10, amp: 2,  spray: 6,  shake: 0, buzz: 0 },
+  herring:  { tint: .12, amp: 3,  spray: 7,  shake: 0, buzz: 0 },
+  shoal:    { tint: .16, amp: 4,  spray: 10, shake: 0, buzz: 10 },
+  twilight: { tint: .22, amp: 6,  spray: 14, shake: 1, buzz: 20 },
+  abyssal:  { tint: .32, amp: 8,  spray: 18, shake: 1, buzz: 35 },
+  pearl:    { tint: .48, amp: 10, spray: 24, shake: 2, buzz: 60 },
+};
+function impact(tier, row, w) {
+  const im = IMPACT[tier], sink = $("#sink");
+  const f = $("#flash");
+  f.className = "tier-" + tier; f.style.setProperty("--a", im.tint); void f.offsetWidth; f.classList.add("on");
+  if (reduceMotion) return;
+  w.style.setProperty("--amp", im.amp + "px");
+  w.classList.remove("impact"); void w.offsetWidth; w.classList.add("impact");
+  sink.classList.remove("jolt1", "jolt2"); void sink.offsetWidth;
+  if (im.shake) sink.classList.add("jolt" + im.shake);
+  const x0 = w.offsetLeft, soft = tier === "bubble" || tier === "herring";
+  for (let i = 0; i < im.spray; i++) {
+    const side = i % 2 ? 1 : -1, d = 30 + Math.random() * (40 + im.amp * 9);
+    const p = document.createElement("i");
+    p.className = "spray" + (soft ? " soft" : "");
+    p.style.cssText = `left:${x0 + side * (8 + Math.random() * 30)}px;--x:${side * d}px;--y:${-(6 + Math.random() * (14 + im.amp * 3))}px;--t:${0.45 + Math.random() * 0.35}s`;
+    row.appendChild(p);
+    setTimeout(() => p.remove(), 900);
+  }
+  if (im.buzz && navigator.vibrate && matchMedia("(pointer: coarse)").matches) try { navigator.vibrate(im.buzz); } catch {}
+}
+function finishSink() {
+  cancelAnimationFrame(sinkRaf); clearTimeout(sinkHold);
+  if (!S || S.state !== "sink") return;
+  showReveal();
+}
+$("#screen-sink").onclick = finishSink;
+
+// ---------- Rarity of one answer (live counts from other divers) and what it means for sharing ----------
+const PICK_MIN = 20;              // below this many divers on a prompt, the numbers say nothing
+function pickFor(h) {
+  if (!h.pickP) h.pickP = api(`pick?q=${encodeURIComponent(h.q)}&a=${encodeURIComponent(h.a)}`).then((r) => (h.pick = r)).catch(() => null);
+  return h.pickP;
+}
+function pickLine(h) {
+  const p = h.pick;
+  if (!p || p.players < PICK_MIN) return null;
+  const all = p.players.toLocaleString("en-US");
+  if (!p.n) return { kind: "first", text: `First diver ever to find this` };
+  if (p.n / p.players <= 0.05) return { kind: "rare", text: `Only ${p.n} of ${all} divers named this` };
+  return { kind: "common", text: `${p.n} of ${all} divers said this too` };
+}
+// Rare tier, or an answer almost nobody gives: something to show off. Otherwise the card dares a friend.
+const BRAG_TIERS = ["twilight", "abyssal", "pearl"];
+function isBrag(h) {
+  const line = pickLine(h);
+  return BRAG_TIERS.includes(h.tier) || !!(line && line.kind !== "common");
+}
+function setShareBtn(h) {
+  const brag = isBrag(h), b = $("#rShare");
+  b.classList.toggle("chip-gold", brag);
+  b.classList.toggle("brag", brag);
+  b.textContent = brag ? "📸 brag about this" : "📸 challenge a friend";
+}
+
+function deeperExamples(tier) {
+  const { byTier } = buildIndex(S.prompt);
+  const pick = (arr, n) => [...(arr || [])].sort(() => Math.random() - 0.5).slice(0, n);
+  const out = {};
+  for (const t of SINK_ORDER.slice(SINK_ORDER.indexOf(tier) + 1)) {
+    if (t === "pearl") { out[t] = "??? still hidden"; continue; }
+    const ex = pick(byTier[t], 2);
+    if (ex.length) out[t] = ex.join(", ");
+  }
+  return out;
+}
+
+function showReveal() {
+  const { tier, before } = S.pending;
+  const T = TIERS[tier], k = SINK_ORDER.indexOf(tier);
+  S.state = "reveal";
+  land();
+  const rows = [...$("#sinkLines").querySelectorAll(".s-row")];
+  const letters = [...T.name.toUpperCase()].map((ch, i) => `<span style="--i:${i}">${ch === " " ? "&nbsp;" : esc(ch)}</span>`).join("");
+  rows[k].insertAdjacentHTML("beforeend",
+    `<div class="r-stage" aria-hidden="true"><div class="r-rays"></div><div class="r-ring"></div><div class="r-ring r2"></div><div class="r-parts" id="rParts"></div></div>` +
+    `<div class="s-detail"><div class="r-head"><span class="r-icon tier-${tier}">${T.icon}</span><span class="r-tier tier-${tier}">${letters}</span></div>` +
+    `<div class="r-gain"><b id="rGainM">+0m</b> · +${T.o2} O₂</div><div class="r-blurb">${esc(T.blurb)}</div><div class="r-pick" id="rPick"></div></div>`);
+  const ex = deeperExamples(tier);
+  rows.forEach((el, i) => { if (ex[SINK_ORDER[i]]) el.querySelector(".s-ex").textContent = ex[SINK_ORDER[i]]; });
+  $("#screen-sink").classList.add("revealed");
+  const h = S.history[S.history.length - 1];
+  setShareBtn(h);
+  pickFor(h).then(() => {
+    if (!S || S.history[S.history.length - 1] !== h || S.state !== "reveal") return;
+    const line = pickLine(h);
+    if (line) { const el = $("#rPick"); el.textContent = line.text; el.className = "r-pick " + line.kind; }
+    setShareBtn(h);
+  });
+  celebrate(tier, T);
+  const passed = overtakes(before, S.depth);
+  passMarkers(before, S.depth, false);
+  passed.forEach((r, i) => toast(`<span class="z">${r.pb ? "PERSONAL BEST" : "OVERTOOK"} · ${fmt(r.depth)}</span> ${r.pb ? "You beat your own record" : "🏁 " + esc(r.name)}`, "rival", 150 + i * 450));
+  setTimeout(() => $("#nextBtn").focus(), 50);
+}
+
+// ---------- Reveal celebration (intensity scales with rarity) ----------
+const FX = {
+  bubble:   { parts: 6,  kind: "bubble" },
+  herring:  { parts: 6,  kind: "bubble" },
+  shoal:    { parts: 10, kind: "bubble" },
+  twilight: { parts: 16, kind: "spark" },
+  abyssal:  { parts: 22, kind: "spark" },
+  pearl:    { parts: 32, kind: "spark" },
+};
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+function celebrate(tier, T) {
+  const fx = FX[tier], el = $("#sink");
+  el.className = "sink done fx-" + tier;
+  void el.offsetWidth;                     // restart CSS animations
+  el.classList.add("fx-on");
+  const parts = $("#rParts");
+  parts.innerHTML = "";
+  if (!reduceMotion) {
+    for (let i = 0; i < fx.parts; i++) {
+      const a = (i / fx.parts) * Math.PI * 2 + Math.random() * 0.5;
+      const d = 70 + Math.random() * (fx.kind === "spark" ? 130 : 70);
+      const p = document.createElement("i");
+      p.className = fx.kind;
+      p.style.cssText = `--x:${Math.cos(a) * d}px;--y:${Math.sin(a) * d - (fx.kind === "bubble" ? 40 : 0)}px;--s:${0.6 + Math.random() * 0.9};--t:${0.6 + Math.random() * 0.5}s;--dl:${Math.random() * 0.12}s`;
+      parts.appendChild(p);
+    }
+  }
+  // count the depth gain up
+  const m = $("#rGainM"), t0 = performance.now(), dur = reduceMotion ? 1 : 500 + T.depth * 0.6;
+  (function tick(now) {
+    const k = Math.min(1, (now - t0) / dur), v = Math.round(T.depth * (1 - Math.pow(1 - k, 3)));
+    m.textContent = `+${v}m`;
+    if (k < 1 && document.body.contains(m)) requestAnimationFrame(tick);
+  })(t0);
+  const dv = $("#depthVal"); dv.classList.remove("bump"); void dv.offsetWidth; dv.classList.add("bump");
+}
+
+// ---------- Rivals: this week's board + your personal best, shown while diving ----------
+let rivals = [];
+async function loadRivals() {
+  const pb = store.get(BEST_KEY, 0);
+  const list = pb ? [{ name: "Your best", depth: pb, pb: true }] : [];
+  rivals = list;
+  try {
+    const rows = await fetchBoard("week");
+    rivals = list.concat(rows.filter((r) => r.me !== myHash).slice(0, 10).map((r) => ({ name: r.name, depth: r.depth, seed: r.me || r.name })))
+      .sort((a, b) => a.depth - b.depth);
+  } catch {}
+  buildGauge();
+}
+const overtakes = (from, to) => rivals.filter((r) => r.depth > from && r.depth < to);
+const nextRival = (d) => rivals.find((r) => r.depth >= d);
+let rivalShown = "";
+function updateRivalHud() {
+  const el = $("#rival");
+  if (!S || !rivals.length || S.state === "over") { el.hidden = true; return; }
+  const n = nextRival(S.shownDepth);
+  const html = n ? `🎯 <b>${esc(n.pb ? "your best" : n.name)}</b> ${fmt(n.depth)} · <em>${fmt(n.depth - S.shownDepth)}</em> to go` : `🏆 deeper than this week's top divers`;
+  if (html !== rivalShown) { el.innerHTML = rivalShown = html; }
+  el.hidden = false;
+}
+
+function skip() {
+  if (S.state !== "ask") return;
+  logEvent("s", null);
+  S.o2 = Math.max(0, S.o2 - SKIP_COST);
+  if (S.o2 <= 0) return endRun(true);
+  S.history.push({ q: S.prompt.q, p: S.prompt, a: "—", tier: "miss" });
+  nextPrompt();
+}
+
+// ---------- Revive: one per device, offered the first time the air runs out ----------
+const canRevive = () => S && !S.revived && !store.get("revived", false) && S.round > 1;
+const canShareRevive = () => S && !S.shareRevived && S.round > 1;   // once per dive, separate from the bookmark revive
+function offerRevive(byAction) {
+  S.state = "revive"; S.diedAt = performance.now(); S.diedByAction = byAction; S.o2 = 0;
+  const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+  const touch = matchMedia("(pointer: coarse)").matches;
+  $("#rvHow").innerHTML = touch
+    ? `Tap your browser's <b>Share</b> or <b>⋮</b> menu → <b>Add bookmark</b>, then come back.`
+    : `Press <kbd>${mac ? "⌘" : "Ctrl"}</kbd> + <kbd>D</kbd> to bookmark this page.`;
+  $("#rvDepth").textContent = fmt(S.depth);
+  $("#rvOk").textContent = "★ I bookmarked it · revive";
+  // Bookmark revive first; the share revive is only offered once that one is used up on this device.
+  const mark = canRevive(), shr = !mark && canShareRevive();
+  $("#rvMarkOpt").hidden = !mark; $("#rvShareOpt").hidden = !shr; $("#rvOr").hidden = !(mark && shr);
+  S.sharedVia = null; shareAway = null;
+  $("#rvNets").hidden = false; $("#rvShareGo").hidden = true;
+  $('[data-rnet="native"]').hidden = !(touch && navigator.share);
+  $("#reviveSheet").hidden = false;
+  updateHud();
+  track("revive_offer", { depth: Math.round(S.depth), bookmark: mark, share: shr });
+  // don't let a held Enter grab it
+  setTimeout(() => S && S.state === "revive" && (shr ? $("#rvNets [data-rnet]:not([hidden])") : $("#rvOk")).focus(), 700);
+}
+function doRevive() {
+  if (!S || S.state !== "revive") return;
+  $("#reviveSheet").hidden = true;
+  logEvent("v", null, S.diedAt); S.diedAt = 0;
+  S.revived = true; store.set("revived", true);
+  S.o2 = REVIVE_O2;
+  S.history.push({ q: S.prompt.q, p: S.prompt, a: "—", tier: "miss" });
+  track("revive_use", { depth: Math.round(S.depth) });
+  toast(`<span class="z">REVIVED · +${REVIVE_O2} O₂</span> Thanks for the bookmark. That was your one free breath.`, "rival", 300);
+  nextPrompt();
+}
+// Share-to-revive. We can't see whether the post went out, so opening a share counts. The new prompt only
+// starts once the player is back and taps "keep diving", so no air drains while they're on the other site.
+function shareReviveText() {
+  return `I ran out of air ${fmt(S.depth)} down in Unlimited Krillion ${trail()}. Name the rarest answer, sink the deepest. Can you beat me?`;
+}
+// Light check that they actually went to post: the page has to be hidden (they're on the other site)
+// for a few seconds before "keep diving" unlocks. The native share sheet counts once it reports success.
+const SHARE_AWAY_MS = 3000;
+let shareAway = null;   // { net, hiddenAt, away }
+function setShareGo(state) {
+  const b = $("#rvShareGo");
+  b.hidden = false;
+  b.disabled = state !== "ok";
+  b.textContent = state === "ok" ? "★ Shared! Keep diving · +50 O₂" : state === "quick" ? "Post it, then come back here" : "⏳ post it, then come back";
+  if (state === "ok") setTimeout(() => S && S.state === "revive" && b.focus(), 300);
+}
+async function shareRevive(net) {
+  if (!S || S.state !== "revive" || !canShareRevive()) return;
+  const text = shareReviveText(), url = `https://unlimited-krillion.org/?ref=share-revive-${net}`;
+  track("share", { method: net, content_type: "revive" });
+  if (net === "native") {
+    try { await navigator.share({ text, url }); }
+    catch (e) { return; }               // cancelled or failed: nothing was shared
+    S.sharedVia = net; setShareGo("ok");
+    return;
+  }
+  shareAway = { net, hiddenAt: 0, away: 0 };
+  window.open(SOCIAL[net](text, url), "_blank", "noopener");
+  if (document.visibilityState === "hidden") shareAway.hiddenAt = performance.now();
+  setShareGo("wait");
+}
+document.addEventListener("visibilitychange", () => {
+  if (!shareAway || !S || S.state !== "revive") return;
+  if (document.visibilityState === "hidden") { shareAway.hiddenAt = performance.now(); return; }
+  if (shareAway.hiddenAt) shareAway.away += performance.now() - shareAway.hiddenAt;
+  shareAway.hiddenAt = 0;
+  if (shareAway.away >= SHARE_AWAY_MS) { S.sharedVia = shareAway.net; setShareGo("ok"); }
+  else setShareGo("quick");
+});
+function doShareRevive() {
+  if (!S || S.state !== "revive" || !S.sharedVia) return;
+  shareAway = null;
+  $("#reviveSheet").hidden = true;
+  logEvent("w", null, S.diedAt); S.diedAt = 0;
+  S.shareRevived = true;
+  S.o2 = REVIVE_O2;
+  S.history.push({ q: S.prompt.q, p: S.prompt, a: "—", tier: "miss" });
+  track("revive_use", { depth: Math.round(S.depth), via: "share", method: S.sharedVia });
+  toast(`<span class="z">REVIVED · +${REVIVE_O2} O₂</span> Thanks for sharing. Keep sinking.`, "rival", 300);
+  nextPrompt();
+}
+function declineRevive() {
+  if (!S || S.state !== "revive") return;
+  $("#reviveSheet").hidden = true;
+  S.state = "ask";
+  track("revive_decline", { depth: Math.round(S.depth) });
+  endRun(S.diedByAction, true);
+}
+
+function endRun(byAction, noRevive) {
+  if (!S || S.state === "over" || S.state === "revive") return;
+  if (S.state === "ask" && !noRevive && (canRevive() || canShareRevive())) return offerRevive(byAction);
+  if (S.state === "ask") {
+    if (!byAction) logEvent("x", null, S.diedAt);
+    S.history.push({ q: S.prompt.q, p: S.prompt, a: "—", tier: "miss" });
+  }
+  S.state = "over";
+  S.o2 = 0;
+  renderPips();
+  const best = store.get(BEST_KEY, 0);
+  const isBest = S.depth > best;
+  if (isBest) store.set(BEST_KEY, S.depth);
+  store.set("runs", store.get("runs", 0) + 1);
+  track("dive_end", { depth: Math.round(S.depth), prompts: S.round, zone: zoneFor(S.depth), personal_best: isBest });
+
+  $("#oDepth").textContent = fmt(S.depth);
+  $("#oZone").textContent = zoneFor(S.depth);
+  $("#oBest").textContent = isBest ? "★ NEW PERSONAL BEST ★" : `personal best: ${fmt(best)}`;
+  $("#oTrail").textContent = trail();
+  $("#oList").innerHTML = S.history.map(catchRow).join("");
+  $("#oBearing").innerHTML = BEARING.map(([d, name, line], i) => {
+    const next = BEARING[i + 1], me = S.depth >= d && (!next || S.depth < next[0]);
+    return `<li class="${me ? "me" : ""}"><span>${fmt(d)}+</span><b>${name}</b><em>${line}</em></li>`;
+  }).join("");
+  $("#oDist").hidden = true;
+  $("#oRank").hidden = true;
+  show("over");
+  updateHud();
+  reportRun(S);
+}
+
+// ---------- Results: the catch (answer sheets), the bearing, the curve ----------
+const BEARING = [
+  [0, "Snorkeler", "Barely got your fins wet."],
+  [1000, "Twilight drifter", "Past the last of the light."],
+  [2500, "Midnight diver", "Proper dark. Most dives end above here."],
+  [4000, "Abyss walker", "Out on the abyssal plain."],
+  [6000, "Trench dweller", "Down in the hadal trenches. Absurd."],
+  [10935, "Below the bottom", "You ran out of ocean."],
+];
+function catchRow(h, i) {
+  const tag = h.tier === "miss" ? `<span class="tier-miss">missed</span>` : `<span class="tier-${h.tier}">${TIERS[h.tier].icon} ${TIERS[h.tier].name}</span>`;
+  return `<li><details><summary><span class="c-q">${esc(h.q)}</span><span class="c-a"><b>${esc(h.a)}</b> ${tag}</span><span class="c-n" data-i="${i}"></span></summary>${sheet(h)}</details></li>`;
+}
+function sheet(h) {
+  const { byTier } = buildIndex(h.p);
+  return `<div class="sheet">` + ["bubble", "herring", "shoal", "twilight", "abyssal", "pearl"].map((t) => {
+    let list = byTier[t] || [];
+    if (!list.length) return "";
+    // the pearl stays a secret until you find it yourself
+    const items = t === "pearl" && h.tier !== "pearl" ? `<i class="hidden-pearl">??? still hidden</i>`
+      : list.map((a) => a === h.a ? `<mark>${esc(a)}</mark>` : esc(a)).join(", ");
+    return `<p><span class="tier-${t}">${TIERS[t].icon} ${TIERS[t].name} <small>${t === "pearl" ? "" : list.length}</small></span> ${items}</p>`;
+  }).join("") + `</div>`;
+}
+function renderPicks(picks) {
+  if (!picks) return;
+  const by = new Map(picks.map((p) => [p.q + "\u0000" + p.matched, p.n]));
+  document.querySelectorAll("#oList .c-n").forEach((el) => {
+    const h = S.history[+el.dataset.i];
+    if (!h || h.tier === "miss") return;
+    const n = by.get(h.q + "\u0000" + h.a);
+    if (n == null) return;
+    el.textContent = n ? `${n.toLocaleString("en-US")} other diver${n > 1 ? "s" : ""} chose this` : "no other diver has found this yet";
+    el.classList.toggle("first", !n);
+  });
+}
+function renderDist(dist) {
+  if (!dist || !dist.n || dist.n < 5) return;
+  const step = dist.step, mine = Math.floor(S.depth / step);
+  const top = Math.max(8, mine + 2, ...dist.buckets.map(([b]) => b + 1));
+  const counts = Array(top + 1).fill(0);
+  dist.buckets.forEach(([b, n]) => (counts[Math.min(b, top)] += n));
+  const max = Math.max(...counts), W = 320, H = 70, bw = W / counts.length;
+  let path = `M0 ${H}`;
+  counts.forEach((n, i) => { const y = H - (n / max) * (H - 6); path += ` L${(i * bw).toFixed(1)} ${y.toFixed(1)} L${((i + 1) * bw).toFixed(1)} ${y.toFixed(1)}`; });
+  path += ` L${W} ${H} Z`;
+  const x = Math.min(W - 2, (S.depth / step) * bw);
+  $("#oDistSvg").innerHTML = `<path d="${path}" class="d-area"/><line x1="0" y1="${H}" x2="${W}" y2="${H}" class="d-base"/>` +
+    `<line x1="${x}" y1="0" x2="${x}" y2="${H}" class="d-you"/><text x="${Math.min(W - 24, Math.max(2, x + 4))}" y="82" class="d-lbl">YOU</text>` +
+    `<text x="2" y="82" class="d-axis">0m</text><text x="${W - 2}" y="82" text-anchor="end" class="d-axis">${fmt(top * step)}+</text>`;
+  $("#oDistTxt").innerHTML = dist.pct == null ? `The first dive on the chart ${dist.period === "day" ? "today" : "this week"}.`
+    : `Deeper than <b>${dist.pct}%</b> of ${dist.period === "day" ? "today's" : "this week's"} dives <span class="dim">· ${dist.n.toLocaleString("en-US")} dives</span>`;
+  $("#oDist").hidden = false;
+}
+
+// ---------- Diver name ----------
+// Everyone gets a fun default so posting is one tap; it becomes "theirs" once posted or edited.
+const ADJ = ["Glowing", "Sunken", "Salty", "Drifting", "Bubbly", "Briny", "Lucky", "Murky", "Silent", "Tidal", "Coral", "Midnight"];
+const CRE = ["Squid", "Krill", "Angler", "Eel", "Octopus", "Urchin", "Lantern", "Jelly", "Manta", "Nautilus", "Shrimp", "Snailfish"];
+function diverName() {
+  let n = store.get("name", null);
+  if (n) return n;
+  n = store.get("autoname", null);
+  if (!n) { const r = (a) => a[Math.floor(Math.random() * a.length)]; n = r(ADJ) + r(CRE) + Math.floor(10 + Math.random() * 90); store.set("autoname", n); }
+  return n;
+}
+function renderDiver() {
+  $("#diverName").textContent = diverName();
+  $("#diverView").hidden = false; $("#diverEdit").hidden = true; $("#diverMsg").textContent = "";
+}
+$("#diverView").onclick = () => {
+  $("#diverView").hidden = true; $("#diverEdit").hidden = false;
+  const i = $("#diverInput"); i.value = diverName(); i.focus(); i.select();
+};
+$("#diverEdit").onsubmit = async (e) => {
+  e.preventDefault();
+  const name = $("#diverInput").value.trim().replace(/\s+/g, " ");
+  if (name.length < 2 || name.length > 16) { $("#diverMsg").textContent = "2–16 characters, please."; return; }
+  try { await api("name", { pid: PID, name }); }
+  catch (err) { if (err.status === 400) { $("#diverMsg").textContent = err.message; return; } }
+  store.set("name", name);
+  Object.keys(boardCache).forEach((k) => delete boardCache[k]);
+  renderDiver();
+  loadPeek();
+};
+$("#diverInput").onkeydown = (e) => { if (e.key === "Escape") renderDiver(); };
+
+// Closing or hiding the page mid-dive: save the partial log (the server replaces it if the dive is finished later).
+function reportAbandon() {
+  if (!S || S.state === "over" || !S.runId) return;
+  beacon("run/abandon", { id: S.runId, pid: PID, log: S.log, touch: TOUCH });
+}
+addEventListener("pagehide", reportAbandon);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") reportAbandon(); });
+
+// ---------- Leaderboard ----------
+async function reportRun(run) {
+  const id = run.runId || (await run.startP);
+  if (!id || run !== S) return;
+  let info;
+  // Category dives are scored and logged like any other but never posted: the global board compares full dives only.
+  try { info = await api("run/end", { id, pid: PID, log: run.log, touch: TOUCH, name: diverName(), named: !!store.get("name", null), board: !CAT && !store.get("noboard", false) }); } catch { return; }
+  if (info.posted) Object.keys(boardCache).forEach((k) => delete boardCache[k]);
+  // The board may already know this diver under another name (e.g. a backfilled dive): adopt it.
+  if (info.name && !store.get("name", null) && info.name !== diverName()) { store.set("autoname", info.name); renderDiver(); }
+  if (run !== S) return;
+  run.rank = info;
+  if (CAT) renderCatRank(); else { renderRank(info); renderDist(info.dist); }
+  renderPicks(info.picks);
+}
+const ord = (n) => "#" + n.toLocaleString("en-US");
+function renderCatRank() {
+  $("#oRank").hidden = false;
+  $("#oRanks").innerHTML = "";
+  $("#postForm").hidden = true;
+  $("#postMsg").innerHTML = `Category dives stay off the global leaderboard. <a href="/">Play a full dive</a> to post a score.`;
+}
+function renderRank(info) {
+  $("#oRank").hidden = false;
+  $("#oRanks").innerHTML = info.suspect ? "" :
+    ["day", "week", "all"].map((k) => `<div><b>${ord(info.rank[k])}</b><span>${{ day: "today", week: "this week", all: "all time" }[k]}</span></div>`).join("");
+  const form = $("#postForm");
+  if (info.suspect) { form.hidden = true; $("#postMsg").textContent = "This dive couldn't be verified, so it stays off the board."; return; }
+  if (!S.depth) { form.hidden = true; $("#postMsg").textContent = "Sink at least one answer deep to make the board."; return; }
+  const off = store.get("noboard", false);
+  $("#postName").value = info.name || diverName();
+  $("#postForm button").textContent = info.posted ? "RENAME" : "POST SCORE";
+  $("#postForm .post-as").textContent = info.posted ? "name" : "post as";
+  if (info.posted) {
+    form.hidden = false;
+    $("#postMsg").innerHTML = `🏆 On the board as <b>${esc(info.name || diverName())}</b> · ${ord(info.rank.week)} this week. <button type="button" class="post-off" id="postOff">take me off the board</button>`;
+    $("#postOff").onclick = unpost;
+  } else if (off) {
+    // Opted out earlier: dives aren't auto-posted. One tap rejoins (posts this dive, turns auto-posting back on).
+    form.hidden = true;
+    $("#postMsg").innerHTML = `You took yourself off the board, so dives aren't posted automatically. <button type="button" class="post-off" id="postOn">rejoin the board</button>`;
+    $("#postOn").onclick = () => postThis(diverName());
+  } else {
+    form.hidden = true;
+    $("#postMsg").textContent = "Your best dive is already on the board. Beat it to move up.";
+  }
+}
+async function unpost() {
+  try { await api("unpost", { pid: PID }); } catch { $("#postMsg").textContent = "Couldn't reach the leaderboard. Try again."; return; }
+  store.set("noboard", true);
+  Object.keys(boardCache).forEach((k) => delete boardCache[k]);
+  S.rank = { ...S.rank, posted: false, name: null };
+  renderRank(S.rank);
+  $("#postMsg").textContent = "Removed. Future dives stay off the board until you post one.";
+  track("unpost_score");
+}
+$("#postForm").onsubmit = (e) => {
+  e.preventDefault();
+  postThis($("#postName").value.trim());
+};
+async function postThis(name) {
+  if (!S || !S.rank) return;
+  const btn = $("#postForm button"); btn.disabled = true;
+  if ($("#postOn")) $("#postOn").disabled = true;
+  try {
+    if (S.rank.posted) {
+      const r = await api("name", { pid: PID, name });
+      store.set("name", r.name);
+      S.rank = { ...S.rank, name: r.name };
+      renderDiver();
+    } else {
+      const info = await api("score", { id: S.rank.id, pid: PID, name });
+      store.set("name", name); store.set("noboard", false);
+      S.rank = { ...info, posted: true, name: info.name || name };
+      track("post_score", { depth: Math.round(S.depth), rank_week: info.rank.week });
+    }
+    Object.keys(boardCache).forEach((k) => delete boardCache[k]);
+    renderRank(S.rank);
+  } catch (err) { $("#postMsg").textContent = err.message === "request failed" ? "Couldn't reach the leaderboard. Try again." : err.message; }
+  btn.disabled = false;
+}
+
+const boardCache = {};
+async function fetchBoard(period) {
+  if (boardCache[period] && Date.now() - boardCache[period].t < 30000) return boardCache[period].rows;
+  const r = await api("leaderboard?period=" + period);
+  boardCache[period] = { t: Date.now(), rows: r.rows };
+  return r.rows;
+}
+const medal = (i) => ["🥇", "🥈", "🥉"][i] || i + 1;
+function boardRow(r, i) {
+  return `<li class="${r.me === myHash ? "me" : ""}"><span class="rk">${medal(i)}</span><span class="nm">${esc(r.name)}</span><span class="zn">${esc(r.zone || "")}</span><span class="dp">${fmt(r.depth)}</span></li>`;
+}
+let boardFrom = "title";
+async function openBoard(period) {
+  if (document.querySelector("#screen-board.active") == null) boardFrom = S && S.state === "over" ? "over" : "title";
+  period = period || store.get("board", "week");
+  store.set("board", period);
+  document.querySelectorAll("#screen-board [role=tab]").forEach((b) => b.setAttribute("aria-selected", b.dataset.period === period));
+  show("board");
+  const list = $("#boardList");
+  list.innerHTML = `<li class="empty">Loading…</li>`;
+  try {
+    const rows = await fetchBoard(period);
+    list.innerHTML = rows.length ? rows.map(boardRow).join("") : `<li class="empty">No dives posted ${period === "day" ? "today" : period === "week" ? "this week" : "yet"}. Be the first.</li>`;
+  } catch { list.innerHTML = `<li class="empty">The leaderboard is unreachable right now.</li>`; }
+  track("view_leaderboard", { period });
+}
+async function loadPeek() {
+  try {
+    const rows = (await fetchBoard("week")).slice(0, 3);
+    if (!rows.length) return;
+    $("#peekList").innerHTML = rows.map(boardRow).join("");
+    $("#peek").hidden = false;
+  } catch {}
+}
+
+// ---------- Markers / toasts ----------
+function passMarkers(from, to, silent) {
+  const found = store.get("log", []);
+  let delay = 200;
+  // Only the deepest fact/zone passed this round gets a toast, so a big jump doesn't spam.
+  const fact = silent ? null : MARKERS.filter((m) => m.d > from && m.d <= to && (m.fact || m.zone)).pop();
+  if (fact) toast(`<span class="z">${fact.zone ? fact.zone + " · " : ""}${fmt(fact.d)}</span> ${fact.fact || ""}`, "", 0);
+  for (const m of MARKERS) {
+    if (m.d > from && m.d <= to) {
+      if (m.creature) {
+        const [name, e] = m.creature;
+        const isNew = !found.includes(name);
+        if (isNew) found.push(name), toast(`<span class="z">NEW SIGHTING · ${fmt(m.d)}</span> ${e} ${name} <span class="dim">added to your field log</span>`, "creature", delay), delay += 600;
+      }
+    }
+  }
+  store.set("log", found);
+}
+function toast(html, cls, delay) {
+  setTimeout(() => {
+    const t = document.createElement("div");
+    t.className = "toast " + (cls || "");
+    t.innerHTML = html;
+    $("#toasts").appendChild(t);
+    setTimeout(() => t.remove(), 5100);
+    while ($("#toasts").children.length > 3) $("#toasts").firstChild.remove();
+  }, delay || 0);
+}
+
+// ---------- Field log ----------
+function renderLog() {
+  const found = store.get("log", []);
+  const creatures = MARKERS.filter((m) => m.creature);
+  $("#logCount").textContent = `${found.length} / ${creatures.length} species sighted · best dive ${fmt(store.get("best", 0))}`;
+  $("#logGrid").innerHTML = creatures.map((m) => {
+    const [name, e, note] = m.creature; const has = found.includes(name);
+    return `<div class="log-item ${has ? "" : "locked"}"><span class="e">${e}</span><b>${has ? name : "???"}</b>${fmt(m.d)}${has ? "<br>" + note : ""}</div>`;
+  }).join("");
+  show("log");
+}
+
+// ---------- Progress pips: recent answers coloured by tier ----------
+function renderPips() {
+  if (!S) return;
+  const recent = S.history.slice(-11);
+  $("#pips").innerHTML = recent.map((h) => `<i class="pip tier-${h.tier}" title="${esc(h.a)}"></i>`).join("") +
+    (S.state === "ask" ? `<i class="pip now"></i>` : "");
+}
+
+// ---------- Rendering ----------
+const fmt = (d) => Math.round(d).toLocaleString("en-US") + "m";
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const trail = () => S.history.map((h) => h.tier === "miss" ? "💀" : TIERS[h.tier].icon).join("");
+
+function bgFor(d) {
+  for (let i = 1; i < BG.length; i++) {
+    if (d <= BG[i][0]) {
+      const [d0, c0] = BG[i - 1], [d1, c1] = BG[i];
+      const t = (d - d0) / (d1 - d0);
+      return `rgb(${c0.map((c, k) => Math.round(c + (c1[k] - c) * t)).join(",")})`;
+    }
+  }
+  return "rgb(0,0,0)";
+}
+
+// Depth ruler: a camera that follows you. ~800m in view, YOU pinned 30% down, the ruler scrolls past
+// (minor tick every 25m, labels every 100m) so every answer visibly carries you down.
+const GAUGE_SPAN = 800, GAUGE_YOU = 0.3;
+const ZONE_DEPTHS = [200, 1000, 4000, 6000, 10935];
+let gaugePpm = 0, gaugeLen = 0;
+const gaugeDepth = () => (S ? (S.state === "over" ? S.depth : S.shownDepth) : 0) || 0;
+function buildGauge() {
+  const track = $("#gaugeTrack");
+  const hpx = $("#gauge").offsetHeight || 500;
+  const ppm = gaugePpm = hpx / GAUGE_SPAN;
+  const full = gaugeLen = Math.max(12000, Math.ceil((gaugeDepth() + 3 * GAUGE_SPAN) / 1000) * 1000);
+  $("#gaugeStrip").style.height = full * ppm + "px";
+  let html = "";
+  for (let d = 0; d <= full; d += 25) {
+    if (ZONE_DEPTHS.some((z) => Math.abs(z - d) < 13)) continue;
+    const cls = d % 100 === 0 ? "maj" : d % 50 === 0 ? "mid" : "";
+    html += `<i class="tk ${cls}" style="top:${(d * ppm).toFixed(1)}px">${cls === "maj" ? `<span>${d.toLocaleString("en-US")}</span>` : ""}</i>`;
+  }
+  html += ZONE_DEPTHS.filter((d) => d <= full).map((d) => `<i class="tk maj zone" style="top:${(d * ppm).toFixed(1)}px"><span>${d.toLocaleString("en-US")}</span></i>`).join("");
+  track.innerHTML = html;
+  // Every rival gets a chip (pixel avatar + name) left of the track. Chips that would collide
+  // are pushed apart and joined to their true depth by a short leader line.
+  const CH = 20;
+  const vis = rivals.filter((r) => r.depth <= full).sort((a, b) => a.depth - b.depth)
+    .map((r) => ({ r, y: r.depth * ppm }));
+  let prev = -Infinity;
+  for (const v of vis) { v.ly = Math.max(v.y, prev + CH); prev = v.ly; }
+  $("#gaugeRivals").innerHTML = vis.map(({ r, y, ly }) => {
+    const nm = r.pb ? "Your best" : r.name;
+    const off = ly - y;
+    return `<span class="g-rival${r.pb ? " pb" : ""}" data-ly="${ly}" style="top:${y}px" title="${esc(nm)} · ${fmt(r.depth)}">` +
+      (Math.abs(off) > 1 ? `<i class="g-lead ${off > 0 ? "dn" : "up"}" style="top:${Math.min(0, off) + 1}px;height:${Math.abs(off)}px"></i>` : "") +
+      `<span class="g-chip" style="transform:translateY(calc(-50% + ${off}px))">${avatar(r.pb ? "pb" : r.seed || nm, r.pb)}<b>${esc(nm.slice(0, 12))}</b><em>${fmt(r.depth)}</em></span></span>`;
+  }).join("");
+}
+// Deterministic 5x5 mirrored pixel avatar, coloured from a hash of the player's id.
+function avatar(seed, pb) {
+  let h = 2166136261;
+  for (const c of String(seed)) h = Math.imul(h ^ c.charCodeAt(0), 16777619);
+  const rnd = () => ((h = Math.imul(h ^ (h >>> 15), 2246822507) ^ Math.imul(h ^ (h >>> 13), 3266489909)) >>> 0) / 4294967296;
+  const hue = Math.floor(rnd() * 360);
+  const fg = pb ? "#7dff9a" : `hsl(${hue} 80% 65%)`, bg = pb ? "#0d3320" : `hsl(${hue} 45% 18%)`;
+  let px = "";
+  for (let y = 0; y < 5; y++) for (let x = 0; x < 3; x++) if (rnd() < 0.5 || (x === 1 && y === 2)) {
+    px += `<rect x="${x + 1}" y="${y + 1}" width="1" height="1"/>`;
+    if (x < 2) px += `<rect x="${5 - x}" y="${y + 1}" width="1" height="1"/>`;
+  }
+  return `<svg class="g-ava" viewBox="0 0 7 7" shape-rendering="crispEdges"><rect width="7" height="7" fill="${bg}"/><g fill="${fg}">${px}</g></svg>`;
+}
+addEventListener("resize", () => { if (!$("#gauge").hidden) { buildGauge(); updateHud(); } });
+
+function updateHud() {
+  if (!S) return;
+  $("#depthVal").textContent = fmt(S.shownDepth);
+  $("#roundVal").textContent = S.round;
+  const o2 = Math.max(0, S.o2);
+  $("#o2Fill").style.width = o2 + "%";
+  $("#o2Val").textContent = Math.ceil(o2);
+  $(".o2").classList.toggle("low", o2 < 25 && S.state === "ask");
+  document.body.style.backgroundColor = bgFor(S.shownDepth);
+  const dark = $("#dark");
+  dark.style.opacity = Math.min(0.96, Math.max(0, (S.shownDepth - 40) / 1300));
+  $("#rays").style.opacity = Math.max(0, 1 - S.shownDepth / 320);
+  dark.style.setProperty("--lr", 70 + o2 * 2.4 + "px");
+  const gd = gaugeDepth();
+  const hpx = $("#gauge").offsetHeight || 500;
+  if (!gaugePpm || Math.abs(gaugePpm - hpx / GAUGE_SPAN) > 1e-6 || gd + 2 * GAUGE_SPAN > gaugeLen) buildGauge();
+  const cam = Math.max(0, gd - GAUGE_YOU * GAUGE_SPAN);
+  $("#gaugeStrip").style.transform = `translateY(${(-cam * gaugePpm).toFixed(1)}px)`;
+  $("#gaugeFill").style.height = gd * gaugePpm + "px";
+  const youPx = gd * gaugePpm;
+  $("#gaugeYou").style.top = youPx - cam * gaugePpm + "px";
+  // Hide rival name chips that sit right where the YOU chip is (their tick stays).
+  for (const el of $("#gaugeRivals").children) el.classList.toggle("near", Math.abs(+el.dataset.ly - youPx) < 24);
+  const dtxt = fmt(S.shownDepth);
+  if ($("#gyDepth").textContent !== dtxt) $("#gyDepth").textContent = dtxt;
+  if (!$("#gyAva").firstChild) $("#gyAva").innerHTML = avatar(PID);
+  updateRivalHud();
+}
+
+// ---------- World scroll: depth notes, silhouettes and creatures move past as you sink ----------
+const PX_PER_M = 2;                           // screen px per metre of depth
+const anchorY = () => innerHeight * (innerWidth <= 640 ? 0.32 : 0.48);
+// The scene lives in a centred band so it hugs the card instead of the screen edges.
+const bandW = () => Math.min(innerWidth, 1180);
+const notes = (() => {
+  const box = $("#notes"), items = [];
+  let side = 0;
+  for (const m of MARKERS) {
+    const add = (html, cls) => {
+      const el = document.createElement("div");
+      el.className = "note " + (side++ % 2 ? "r" : "l") + (cls ? " " + cls : "");
+      el.innerHTML = html;
+      box.appendChild(el);
+      items.push({ d: m.d, el });
+    };
+    if (m.zone) add(`<b>${m.zone}</b>`, "zone");
+    if (m.fact) add(`${fmt(m.d)} · ${m.fact}`);
+    if (m.creature) add(`${m.creature[1]} ${m.creature[0].toLowerCase()} territory`);
+  }
+  let shown = -1;
+  return function update(depth) {
+    if (Math.abs(depth - shown) < 0.3) return;
+    shown = depth;
+    const a = anchorY(), h = innerHeight;
+    for (const it of items) {
+      const y = a + (it.d - depth) * PX_PER_M;
+      const vis = y > -40 && y < h + 40;
+      it.el.style.display = vis ? "" : "none";
+      if (vis) it.el.style.transform = `translateY(${y.toFixed(1)}px)`;
+    }
+  };
+})();
+
+// Pixel sprites, facing right. '#' body, 'o' glow, ':' faint filament.
+const SPRITES = {
+  sardine:  { rows: ["  #  #", "######", "  #  #"], zone: [0, 260], school: 6, speed: 26, glow: null },
+  turtle:   { rows: ["  ##  ", " #### #", "#######", " #### #", "  #  # "], zone: [0, 250], speed: 9, glow: null },
+  jelly:    { rows: [" #### ", "######", "#o##o#", " # # #", "# # # ", " #  # "], zone: [150, 1400], speed: 5, glow: "#b48cff", bob: 3 },
+  lantern:  { rows: ["  ###  #", "o####### ", "#o#o#o##", "  ###  #"], zone: [300, 1500], school: 3, speed: 20, glow: "#7fe8ff" },
+  squid:    { rows: ["##        ", "  ######## ", "############o", "  ######## ", "##        "], zone: [400, 2500], speed: 16, glow: "#ff6b5c" },
+  angler:   { rows: ["      :o", "     :  ", " ######:", "########", "#  ##### ", " ###### "], zone: [900, 5000], speed: 7, glow: "#ffcf5c" },
+  gulper:   { rows: ["####                 ", "#   ###############o", "####                 "], zone: [1500, 7000], speed: 11, glow: "#ff5c8a", wave: true },
+  vampire:  { rows: [" #### ", "#o##o#", "######", "# ## #", "#    #"], zone: [1200, 4500], speed: 6, glow: "#ff5c8a", bob: 2 },
+  dumbo:    { rows: ["#    #", "######", "#o##o#", " #### ", "# ## #"], zone: [3500, 8000], speed: 4, glow: "#7fe8ff", bob: 4 },
+  isopod:   { rows: [" ######", "########", "# # # #"], zone: [3000, 9000], speed: 5, glow: null },
+  snail:    { rows: ["  ####  ", "o#######", "  ######"], zone: [6000, 11000], speed: 6, glow: "#e6f7ff" },
+  eyes:     { rows: ["o   o"], zone: [5000, 1e9], speed: 2, glow: "#ffe28a", blink: true },
+  thing:    { rows: ["   ###   ", " ##o#o## ", "#########", "# # # # #", "#  #  #  #"], zone: [9000, 1e9], speed: 3, glow: "#ff5c8a", bob: 2 },
+  // sunlit shallows
+  seahorse: { rows: [" ##", "###", " # ", " ##", "  #", " # "], zone: [0, 180], speed: 2, glow: null, bob: 3 },
+  manta:    { rows: ["   ##    ", " ######  ", "#########", " ######  ", "   ##  ##"], zone: [0, 350], speed: 10, glow: null, bob: 3 },
+  whale:    { rows: ["#              ", "##   ######### ", " ##############", "##   ##########", "#      ####### "], zone: [20, 500], speed: 5, glow: null, size: 1.8 },
+  shark:    { rows: ["     #      ", "    ##      ", "##########  ", " ###########", "##########  ", "     #      "], zone: [40, 700], speed: 18, glow: null },
+  // twilight
+  oarfish:  { rows: [":::::::::::::::::::::   ", "########################"], zone: [150, 1000], speed: 7, glow: null, wave: true },
+  hatchet:  { rows: ["  ## ", "#####", "#ooo#"], zone: [300, 1200], school: 4, speed: 14, glow: "#8fd8ff" },
+  comb:     { rows: [" ## ", "#oo#", "#oo#", " ## "], zone: [400, 3000], speed: 3, glow: "rainbow", bob: 3 },
+  barreleye:{ rows: [" oo   ", "######", "#######", "######"], zone: [500, 1500], speed: 6, glow: "#7dff9a" },
+  // midnight and below
+  siphono:  { rows: ["o o o o o o o o o o o o o o"], zone: [700, 4000], speed: 3, glow: "#b48cff", wave: true },
+  chimaera: { rows: ["        ##   ", " ###########o", "#############", "  ##    #####"], zone: [1500, 5500], speed: 8, glow: "#7fe8ff" },
+  tripod:   { rows: [" ######o", "########", " #   #  ", " #    # ", "#      #"], zone: [3500, 8500], speed: 4, glow: "#ffe28a" },
+  seapig:   { rows: [" # # #  ", "########", "######o#", "# # # # "], zone: [4500, 10000], speed: 3, glow: "#ffb3c7", bob: 1 },
+  // below the trench: things that shouldn't be
+  swarm:    { rows: ["o  o ", " o  o", "o o  "], zone: [7000, 1e9], speed: 2, glow: "#9cff5c", blink: true },
+  leviathan:{ rows: ["      ##########          ", "  ##################o o   ", "###########################", "  ######o##########o#####  ", "      ##  ##  ##  ##       "], zone: [8500, 1e9], speed: 2, glow: "#ff3b3b", blink: true, size: 2.2 },
+};
+const scene = (() => {
+  const c = $("#scene"), g = c.getContext("2d");
+  let W = 0, H = 0, PX = 4, U = 3, B0 = 0, BW = 0;
+  const KELP = [[0.02, 40], [0.07, 110], [0.12, 170], [0.88, 70], [0.93, 20], [0.98, 140]]; // x within band, top depth
+  const KELP_FLOOR = 560;
+  const VENTS = [[0.08, 2350, 2700], [0.9, 3450, 3800], [0.14, 5200, 5450]];
+  let mobs = [], nextSpawn = 0, lastT = 0;
+  function resize() {
+    PX = innerWidth < 640 ? 3 : 4;
+    W = Math.ceil(innerWidth / PX); H = Math.ceil(innerHeight / PX);
+    BW = Math.ceil(bandW() / PX); B0 = Math.floor((W - BW) / 2);
+    c.width = W; c.height = H; U = Math.max(1, BW / 120);
+  }
+  const noise = (d, s) => 4 * Math.sin(d / 53 + s * 2.1) + 3 * Math.sin(d / 17 + s * 5.3) + 1.6 * Math.sin(d / 7.3 + s);
+  function bias(d) {
+    if (d < 260) return -99;
+    if (d < 1000) return -6 + 5 * (d - 260) / 740;
+    if (d < 6000) return -1.5;
+    return Math.min(16, -1.5 + (d - 6000) / 350);
+  }
+  const m0scale = () => (Math.random() < 0.25 ? 1.7 : 1);
+  function spawn(depth, t, inView) {
+    const span = (H * PX) / PX_PER_M;                       // metres visible on screen
+    const top = Math.max(15, depth - anchorY() / PX_PER_M + 10), bot = depth - anchorY() / PX_PER_M + span - 10;
+    const d = top < bot ? top + Math.random() * (bot - top) : depth + (Math.random() - 0.4) * span * 0.8;
+    const pool = Object.values(SPRITES).filter((s) => d >= s.zone[0] && d < s.zone[1]);
+    if (!pool.length) return;
+    const sp = pool[Math.floor(Math.random() * pool.length)];
+    const dir = Math.random() < 0.5 ? 1 : -1, w = sp.rows[0].length * 2;
+    mobs.push({ sp, dir, x: inView ? Math.random() * W : dir > 0 ? -w * 2 : W + w, d,
+      v: sp.speed * (0.6 + Math.random() * 0.8) / PX, s: m0scale(), ph: Math.random() * 6.3,
+      school: sp.school ? Array.from({ length: sp.school }, () => [Math.random() * 14 - 7, Math.random() * 10 - 5]) : [[0, 0]] });
+  }
+  function drawMob(m, y, t) {
+    const { sp } = m, s = Math.round(m.s * (sp.size || 1) * Math.max(2, U * 0.9)), rows = sp.rows, w = rows[0].length;
+    const deep = Math.min(1, m.d / 1500);
+    const body = `rgba(${Math.round(6 + deep * 70)},${Math.round(26 + deep * 80)},${Math.round(44 + deep * 90)},${0.82 - deep * 0.2})`;
+    const on = !sp.blink || Math.sin(t / 700 + m.ph) > -0.6;
+    const flick = 0.65 + 0.35 * Math.sin(t / 200 + m.ph);
+    for (const [ox, oy] of m.school) {
+      const bx = Math.round(m.x + ox * s * 2), by = Math.round(y + oy * s * 2 + Math.sin(t / 600 + m.ph + ox) * (sp.bob || 1) * s);
+      for (let r = 0; r < rows.length; r++) for (let i = 0; i < w; i++) {
+        const ch = rows[r][m.dir > 0 ? i : w - 1 - i];
+        if (ch === " ") continue;
+        const wy = sp.wave ? Math.round(Math.sin(i / 2.5 + t / 250 + m.ph) * s) : 0;
+        if (ch === "#") g.fillStyle = body;
+        else if (ch === ":") g.fillStyle = "rgba(200,220,230,.25)";
+        else { if (!on) continue; g.fillStyle = sp.glow === "rainbow" ? `hsl(${(t / 8 + i * 40 + r * 25) % 360},90%,65%)` : sp.glow || body; g.globalAlpha = sp.glow ? flick : 1; }
+        g.fillRect(bx + i * s, by + r * s + wy, s, s);
+        g.globalAlpha = 1;
+        if (ch === "o" && on && sp.glow && m.d > 300) { g.globalAlpha = 0.18 * flick; g.fillRect(bx + i * s - s, by + r * s + wy - s, s * 3, s * 3); g.globalAlpha = 1; }
+      }
+    }
+  }
+  function draw(t, depth) {
+    if (!W) return;
+    const dt = Math.min(100, t - lastT); lastT = t;
+    g.clearRect(0, 0, W, H);
+    const k = PX_PER_M / PX, a = anchorY() / PX;
+    const deep = Math.min(1, depth / 3000);
+    const rock = depth > 30000 ? "rgba(40,8,0,.55)" : "rgba(0,4,10,.5)";
+    const rim = `rgba(120,200,240,${0.08 + deep * 0.12})`;
+    for (let r = 0; r < H; r++) {
+      const d = depth + (r - a) / k;
+      if (d < 0) continue;
+      const b = bias(d);
+      if (b > -20) {
+        const wl = Math.round(U * Math.max(0, noise(d, 0) + b)), wr = Math.round(U * Math.max(0, noise(d, 1) + b));
+        g.fillStyle = rock;
+        if (wl) g.fillRect(0, r, B0 + wl, 1);
+        if (wr) g.fillRect(B0 + BW - wr, r, W - (B0 + BW - wr), 1);
+        g.fillStyle = rim;
+        if (wl) g.fillRect(B0 + wl, r, 1, 1);
+        if (wr) g.fillRect(B0 + BW - wr - 1, r, 1, 1);
+      }
+      if (d < KELP_FLOOR) {
+        g.fillStyle = "rgba(6,38,30,.6)";
+        KELP.forEach(([x, top], i) => {
+          if (d < top) return;
+          const free = 1 - (d - top) / (KELP_FLOOR - top);
+          const sx = Math.round(B0 + x * BW + Math.sin(d / 22 + t / 1100 + i) * 2.2 * U * free);
+          g.fillRect(sx, r, Math.max(1, Math.round(U * 0.8)), 1);
+          if ((Math.floor(d) + i * 7) % 26 < 4) g.fillRect(sx + ((Math.floor(d / 26) + i) % 2 ? 1 : -2) * Math.round(U), r, Math.round(U * 1.6), 1);
+        });
+      }
+      for (const [x, top, base] of VENTS) {
+        const cx = Math.round(B0 + x * BW);
+        if (d >= top && d <= base) {
+          const w = Math.round(U * (1.2 + 3 * (d - top) / (base - top)));
+          g.fillStyle = rock; g.fillRect(cx - w, r, w * 2, 1);
+          g.fillStyle = "rgba(255,140,60,.18)"; g.fillRect(cx - w, r, 1, 1);
+        } else if (d < top && d > top - 260) {
+          const f = (top - d) / 260;
+          for (let j = 0; j < 3; j++) {
+            const px = cx + Math.round(Math.sin(d / 9 + t / 260 + j * 2) * U * (1 + f * 5));
+            g.fillStyle = `rgba(200,220,230,${0.14 * (1 - f)})`; g.fillRect(px, r, Math.round(U), 1);
+          }
+        }
+      }
+    }
+    // creatures: more of them, and stranger, the deeper you go
+    if (!reduceMotion) {
+      const title = document.body.classList.contains("on-title");
+      const cap = (depth < 200 ? 4 : depth < 2000 ? 5 : 6) + (title ? 3 : 0);
+      if (!nextSpawn && title) for (let i = 0; i < 4; i++) spawn(depth, t, true);
+      if (t > nextSpawn && mobs.length < cap) { spawn(depth, t); nextSpawn = t + (title ? 500 + Math.random() * 1200 : 1800 + Math.random() * (depth < 1000 ? 4000 : 2600)); }
+      mobs = mobs.filter((m) => {
+        m.x += m.dir * m.v * dt / 1000 * 10;
+        const y = a + (m.d - depth) * k;
+        if (m.x < -60 || m.x > W + 60 || y < -80 || y > H + 80) return false;
+        drawMob(m, y, t);
+        return true;
+      });
+    }
+  }
+  return { resize, draw, reset: () => { mobs = []; nextSpawn = 0; } };
+})();
+
+// marine snow
+const cv = $("#snow"), ctx = cv.getContext("2d");
+let flakes = [], boost = 0;
+function resize() {
+  cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio;
+  flakes = Array.from({ length: Math.round(innerWidth * innerHeight / 9000) }, () => ({
+    x: Math.random() * cv.width, y: Math.random() * cv.height, r: (Math.random() * 1.6 + 0.4) * devicePixelRatio, v: Math.random() * 0.3 + 0.1,
+  }));
+  sky.resize();
+  scene.resize();
+}
+function burst(meters) { boost = Math.min(30, 6 + meters / 25); }
+
+// ---------- Dusk surface scene (pixel art, drawn at 1/PX resolution) ----------
+const sky = (() => {
+  const c = $("#skyCanvas"), g = c.getContext("2d");
+  let W = 0, H = 0, PX = 4, stars = [], clouds = [], horizon = 0;
+  const BANDS = ["#140f33", "#1d1545", "#2a1a57", "#3d2066", "#58276f", "#7a2f74", "#a13b72", "#c94c6b", "#e66a62", "#f4915c"];
+  const rnd = (a) => { let s = a; return () => ((s = (s * 16807) % 2147483647) / 2147483647); };
+  function resize() {
+    PX = innerWidth < 640 ? 3 : 4;
+    const box = $("#sky").getBoundingClientRect();
+    W = Math.ceil(box.width / PX); H = Math.ceil(box.height / PX);
+    c.width = W; c.height = H;
+    horizon = H - Math.round(Math.min(18, H * 0.14));
+    document.documentElement.style.setProperty("--seaband", (H - horizon) * PX + "px");
+    const r = rnd(7);
+    stars = Array.from({ length: Math.round(W * horizon / 160) }, () => ({ x: Math.floor(r() * W), y: Math.floor(r() * horizon * 0.62), p: r() * 6.28, b: r() < 0.15 }));
+    clouds = [[0.12, 0.30, 1.0], [0.55, 0.20, 0.8], [0.86, 0.42, 1.2], [0.34, 0.50, 0.7]].map(([x, y, s], i) => ({ x: x * W, y: Math.round(y * horizon), s, v: 0.6 + i * 0.25 }));
+  }
+  function cloud(x, y, s) {
+    const rows = [[6, 10], [3, 18], [1, 24], [0, 28], [2, 26]].map(([o, w]) => [Math.round(o * s), Math.round(w * s)]);
+    rows.forEach(([o, w], i) => {
+      g.fillStyle = i < 2 ? "#f6b0a0" : i < 4 ? "#d27a8c" : "#8e4a7e";
+      g.fillRect(Math.round(x + o), y + i, w, 1);
+    });
+  }
+  function draw(t) {
+    if (!W) return;
+    // banded dusk sky with one-row dither between bands
+    const bh = horizon / BANDS.length;
+    for (let i = 0; i < BANDS.length; i++) {
+      g.fillStyle = BANDS[i]; g.fillRect(0, Math.floor(i * bh), W, Math.ceil(bh) + 1);
+      if (i) { g.fillStyle = BANDS[i - 1]; const y = Math.floor(i * bh); for (let x = (y & 1); x < W; x += 2) g.fillRect(x, y, 1, 1); }
+    }
+    for (const s of stars) {
+      const a = 0.35 + 0.65 * Math.abs(Math.sin(t / 900 + s.p));
+      g.fillStyle = `rgba(255,240,220,${a})`; g.fillRect(s.x, s.y, 1, 1);
+      if (s.b && a > 0.85) { g.fillStyle = "rgba(255,240,220,.5)"; g.fillRect(s.x - 1, s.y, 1, 1); g.fillRect(s.x + 1, s.y, 1, 1); g.fillRect(s.x, s.y - 1, 1, 1); g.fillRect(s.x, s.y + 1, 1, 1); }
+    }
+    // setting sun with retro stripes
+    const sx = Math.round(W * (W < 200 ? 0.78 : 0.8)), R = Math.max(8, Math.round(Math.min(W * 0.11, H * 0.16)));
+    for (let dy = -R; dy <= 0; dy++) {
+      const half = Math.round(Math.sqrt(R * R - dy * dy));
+      const k = -dy / R;
+      if (dy > -R * 0.55 && (dy & 3) === 0) continue;
+      g.fillStyle = k > 0.6 ? "#ffe9a8" : k > 0.3 ? "#ffd27a" : "#ffb062";
+      g.fillRect(sx - half, horizon + dy, half * 2, 1);
+    }
+    for (const cl of clouds) {
+      cl.x += cl.v * 0.02; if (cl.x > W + 10) cl.x = -32 * cl.s;
+      cloud(cl.x, cl.y, cl.s);
+    }
+    // lighthouse on a rock
+    const lx = Math.round(W * (W < 200 ? 0.14 : 0.16)), base = horizon;
+    g.fillStyle = "#1a1030";
+    [[-14, 14, 0], [-11, 11, -1], [-8, 7, -2], [-5, 5, -3]].forEach(([a, b, y]) => g.fillRect(lx + a, base + y, b - a, 1));
+    for (let y = 0; y < 16; y++) { const w = 3 + Math.floor((16 - y) / 6); g.fillStyle = Math.floor(y / 3) % 2 ? "#e8e0f0" : "#d94a5c"; g.fillRect(lx - w, base - 4 - y, w * 2, 1); }
+    g.fillStyle = "#1a1030"; g.fillRect(lx - 4, base - 21, 8, 1); g.fillRect(lx - 3, base - 26, 6, 1); g.fillRect(lx - 2, base - 27, 4, 1);
+    const on = 0.75 + 0.25 * Math.sin(t / 300);
+    g.fillStyle = `rgba(255,214,110,${on})`; g.fillRect(lx - 3, base - 25, 6, 4);
+    // sweeping beam
+    const sweep = Math.sin(t / 1600);
+    const len = W * 0.42 * Math.abs(sweep), dir = Math.sign(sweep) || 1;
+    for (let i = 1; i < len; i++) {
+      const spread = Math.floor(i * 0.12);
+      g.fillStyle = `rgba(255,224,150,${0.22 * (1 - i / len)})`;
+      g.fillRect(lx + dir * i, base - 23 - spread, 1, spread * 2 + 1);
+    }
+    // sea
+    g.fillStyle = "#1f4f86"; g.fillRect(0, horizon, W, H - horizon);
+    g.fillStyle = "#235b94"; g.fillRect(0, horizon + Math.round((H - horizon) * 0.45), W, H);
+    g.fillStyle = "#18548a"; g.fillRect(0, H - 3, W, 3);
+    // sun glitter
+    for (let y = horizon + 1; y < H - 2; y += 2) {
+      const spread = Math.round(R * (1 - (y - horizon) / (H - horizon)) + 2);
+      for (let x = sx - spread; x < sx + spread; x += 3) {
+        if (Math.sin(x * 1.7 + y * 2.3 + t / 220) > 0.35) { g.fillStyle = y - horizon < 6 ? "#ffd27a" : "#e9905f"; g.fillRect(x, y, 2, 1); }
+      }
+    }
+    // rolling wave crests
+    g.fillStyle = "rgba(170,220,255,.45)";
+    for (let y = horizon + 3; y < H - 3; y += 4) {
+      const off = (t / (60 + y)) % 18;
+      for (let x = -18 + off + (y % 8); x < W; x += 18) g.fillRect(Math.round(x), y, 4, 1);
+    }
+    g.fillStyle = "#ffe0b0"; g.fillRect(0, horizon, W, 1);
+  }
+  return { resize, draw };
+})();
+
+let last = performance.now(), dialShown = "";
+// Round dial left of the input: free reading time first, then your air.
+function updateDial(now) {
+  const rem = GRACE_MS - (now - S.askedAt), o2 = Math.max(0, S.o2);
+  const mode = rem > 0 ? "read" : o2 < 25 ? "low" : "air";
+  const num = rem > 0 ? (rem / 1000).toFixed(1) : String(Math.ceil(o2));
+  const fill = rem > 0 ? (rem / GRACE_MS) * 100 : o2;
+  const key = mode + num;
+  if (key === dialShown) return;
+  dialShown = key;
+  $("#dial").className = mode;
+  $("#dialNum").textContent = num;
+  $("#dialLbl").textContent = rem > 0 ? "read" : "O₂";
+  $("#dialRing").style.strokeDasharray = `${fill.toFixed(1)} 100`;
+  document.body.classList.toggle("grace", rem > 0);
+}
+function frame(now) {
+  const real = now - last, dt = Math.min(100, real); last = now;
+  // Air drains by wall-clock time (matches the server's replay), even across slow
+  // frames or a hidden tab: thinking time is never free.
+  const drainFrom = S ? Math.max(now - real, S.askedAt + GRACE_MS) : now;
+  if (S && S.state === "ask" && now > drainFrom) {
+    S.o2 -= S.rate * (now - drainFrom) / 1000;
+    if (S.o2 <= 0) endRun();
+  }
+  if (S && S.state === "ask") updateDial(now);
+  if (S && S.state !== "sink" && S.shownDepth < S.depth) S.shownDepth = Math.min(S.depth, S.shownDepth + Math.max(1.5, (S.depth - S.shownDepth) * 0.035) * dt / 16.7);
+  // snow drifts up as we sink
+  boost *= 0.96;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = "rgba(220,240,255,0.55)";
+  for (const f of flakes) {
+    f.y -= (f.v + boost * f.v) * dt / 16;
+    f.x += Math.sin((now / 1000) + f.y / 80) * 0.15;
+    if (f.y < -4) { f.y = cv.height + 4; f.x = Math.random() * cv.width; }
+    ctx.beginPath(); ctx.arc(f.x, f.y, f.r, 0, 6.283); ctx.fill();
+  }
+  if (document.body.classList.contains("on-title")) {
+    if (scrollY < innerHeight) sky.draw(now);
+    const td = titleDepth();
+    scene.draw(now, td);
+    document.body.style.backgroundColor = bgFor(td);
+    $("#dark").style.opacity = Math.min(0.8, Math.max(0, (td - 150) / 2200));
+  }
+  else if (S) { scene.draw(now, S.shownDepth); updateHud(); }
+  requestAnimationFrame(frame);
+}
+
+// Title page: scrolling down the page is a dive. Near the surface 1px = 1px of real
+// depth (so the scene lines up with the sea line), then it stretches so the page
+// bottom reaches below the trench, where the strangest things live.
+const TITLE_MAX_DEPTH = 11500;
+function titleDepth() {
+  const seaTop = $("#sky").offsetHeight;
+  const lin = Math.max(0, scrollY + anchorY() - seaTop) / PX_PER_M;
+  const linMax = Math.max(1, (document.documentElement.scrollHeight - innerHeight + anchorY() - seaTop) / PX_PER_M);
+  const p = Math.min(1, lin / linMax);
+  return lin + p * p * Math.max(0, TITLE_MAX_DEPTH - linMax);
+}
+
+// Divers online: a made-up but plausible number. Follows a daily curve (busiest in
+// US evenings), seeded per minute so visitors see roughly the same figure, plus jitter.
+const online = (() => {
+  const hash = (n) => { n = Math.imul(n ^ (n >>> 16), 0x45d9f3b); n = Math.imul(n ^ (n >>> 16), 0x45d9f3b); return ((n ^ (n >>> 16)) >>> 0) / 4294967296; };
+  const target = () => {
+    const now = Date.now(), h = (now / 3600000) % 24;
+    const curve = 0.5 + 0.5 * Math.cos(((h - 1) / 24) * Math.PI * 2); // peak ~01:00 UTC
+    return Math.round(180 + 340 * curve + (hash(Math.floor(now / 60000)) - 0.5) * 60);
+  };
+  let n = target();
+  const el = $("#onlineN");
+  function tick() {
+    n += Math.round((target() - n) * 0.3 + (Math.random() - 0.5) * 7);
+    if (el) el.textContent = n.toLocaleString("en-US");
+    setTimeout(tick, 3000 + Math.random() * 5000);
+  }
+  return { start: tick };
+})();
+
+// Phones: the answer bar is docked to the bottom (style.css); keep it just above the on-screen keyboard.
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const kb = () => {
+    const h = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+    document.documentElement.style.setProperty("--kb", h + "px");
+    document.body.classList.toggle("kb-open", h > 80);
+  };
+  vv.addEventListener("resize", kb);
+  vv.addEventListener("scroll", kb);
+  kb();
+}
+
+// ---------- Wiring ----------
+function refreshTitle() {
+  renderDiver();
+  const best = store.get(BEST_KEY, 0), runs = store.get("runs", 0), seen = store.get("log", []).length;
+  $("#bestLine").innerHTML = runs ? `best <b>${fmt(best)}</b> · ${runs} dive${runs > 1 ? "s" : ""} · ${seen} species` : "first dive · good luck";
+  scene.reset();
+  loadPeek();
+}
+const toTitle = () => { refreshTitle(); show("title"); };
+// Never start a dive without a question bank (see ensurePrompts).
+let starting = false;
+async function tryStart() {
+  if (promptsReady()) { $("#startMsg").textContent = ""; return startRun(); }
+  if (starting) return;
+  starting = true;
+  $("#startMsg").textContent = "Loading questions…";
+  const ok = await ensurePrompts();
+  starting = false;
+  if (ok) { $("#startMsg").textContent = ""; return startRun(); }
+  if (!$("#screen-title").classList.contains("active")) show("title");
+  $("#startMsg").textContent = "Couldn't load the questions. Check your connection (or a school/work web filter) and tap again.";
+}
+$("#startBtn").onclick = tryStart;
+$("#againBtn").onclick = tryStart;
+$("#nextBtn").onclick = () => S && S.state === "reveal" && nextPrompt();
+$("#skipBtn").onclick = skip;
+$("#logBtn").onclick = renderLog;
+$("#logBtn2").onclick = renderLog;
+document.querySelectorAll("#screen-board [role=tab]").forEach((b) => (b.onclick = () => openBoard(b.dataset.period)));
+$("#logBack").onclick = () => { if (S && S.state === "over") show("over"); else toTitle(); };
+$("#boardBack").onclick = () => { if (boardFrom === "over" && S && S.state === "over") show("over"); else toTitle(); };
+$("#answerForm").onsubmit = (e) => { e.preventDefault(); submitAnswer($("#answer").value); };
+$("#shareBtn").onclick = async () => {
+  const txt = `Unlimited Krillion 🏮 ${fmt(S.depth)} · ${zoneFor(S.depth)}\n${trail()}\nhttps://unlimited-krillion.org/?ref=copy`;
+  track("share", { method: "copy", content_type: "result", depth: Math.round(S.depth) });
+  try { await navigator.clipboard.writeText(txt); $("#shareBtn").textContent = "copied!"; }
+  catch { $("#shareBtn").textContent = txt; }
+  setTimeout(() => ($("#shareBtn").textContent = "copy result"), 2000);
+};
+
+// ---------- Share card: a 1080×1350 pixel-style image of one catch or the whole dive ----------
+const CARD_W = 1080, CARD_H = 1350;
+const TIER_COL = { bubble: "#cfe9f5", herring: "#ff6b5c", shoal: "#5fd0f0", twilight: "#b48cff", abyssal: "#ff9f43", pearl: "#ffe28a" };
+const RARITY = ["miss", "bubble", "herring", "shoal", "twilight", "abyssal", "pearl"];
+let shareData = null;
+
+function wrapLines(g, text, maxW) {
+  const out = []; let line = "";
+  for (const w of String(text).split(/\s+/)) {
+    const t = line ? line + " " + w : w;
+    if (g.measureText(t).width > maxW && line) { out.push(line); line = w; } else line = t;
+  }
+  if (line) out.push(line);
+  return out;
+}
+function fitFont(g, text, font, size, maxW, min = 28) {
+  for (; size > min; size -= 4) { g.font = font.replace("#", size); if (g.measureText(text).width <= maxW) break; }
+  g.font = font.replace("#", size);
+  return size;
+}
+async function drawCard(kind) {
+  try { await Promise.all(['400 40px "Silkscreen"', '700 40px "Silkscreen"', '400 40px "JetBrains Mono"', '600 40px "JetBrains Mono"'].map((f) => document.fonts.load(f))); } catch {}
+  const c = document.createElement("canvas"); c.width = CARD_W; c.height = CARD_H;
+  const g = c.getContext("2d");
+  const depth = S.depth;
+  // Water: the colour of where you are, darkening downward.
+  const bg = g.createLinearGradient(0, 0, 0, CARD_H);
+  bg.addColorStop(0, bgFor(Math.max(0, depth - 250))); bg.addColorStop(1, bgFor(depth + 900));
+  g.fillStyle = bg; g.fillRect(0, 0, CARD_W, CARD_H);
+  g.fillStyle = "rgba(0,0,0,.28)"; g.fillRect(0, 0, CARD_W, CARD_H);
+  // Light rays near the surface, pixel motes everywhere.
+  if (depth < 400) {
+    g.save(); g.globalAlpha = 0.07 * (1 - depth / 400);
+    for (let i = 0; i < 6; i++) { g.fillStyle = "#fff"; g.beginPath(); const x = 80 + i * 180; g.moveTo(x, 0); g.lineTo(x + 70, 0); g.lineTo(x - 160, CARD_H); g.lineTo(x - 260, CARD_H); g.fill(); }
+    g.restore();
+  }
+  let seed = Math.round(depth) * 7 + S.round;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  for (let i = 0; i < 90; i++) { g.fillStyle = `rgba(200,240,255,${0.08 + rnd() * 0.25})`; const s = rnd() < 0.2 ? 8 : 4; g.fillRect(Math.round(rnd() * CARD_W / 4) * 4, Math.round(rnd() * CARD_H / 4) * 4, s, s); }
+  // Pixel frame.
+  g.fillStyle = "rgba(5,10,20,.55)"; g.fillRect(48, 48, CARD_W - 96, CARD_H - 96);
+  g.strokeStyle = "rgba(95,208,240,.6)"; g.lineWidth = 4; g.strokeRect(48, 48, CARD_W - 96, CARD_H - 96);
+  g.fillStyle = "#5fd0f0"; [[44, 44], [CARD_W - 60, 44], [44, CARD_H - 60], [CARD_W - 60, CARD_H - 60]].forEach(([x, y]) => g.fillRect(x, y, 16, 16));
+  // Depth gauge down the right edge (dive card only; the catch card has its own ladder).
+  if (kind !== "catch") {
+  const gx = CARD_W - 110, gy0 = 200, gy1 = CARD_H - 260, gmax = Math.max(11000, depth * 1.1);
+  const gg = g.createLinearGradient(0, gy0, 0, gy1); gg.addColorStop(0, "#5fd0f0"); gg.addColorStop(0.3, "#0b2540"); gg.addColorStop(1, "#000");
+  g.fillStyle = gg; g.fillRect(gx, gy0, 10, gy1 - gy0);
+  g.strokeStyle = "rgba(255,255,255,.25)"; g.lineWidth = 2; g.strokeRect(gx, gy0, 10, gy1 - gy0);
+  const gy = gy0 + (gy1 - gy0) * Math.min(1, depth / gmax);
+  g.fillStyle = "#ff5c8a"; g.beginPath(); g.moveTo(gx - 6, gy); g.lineTo(gx - 30, gy - 14); g.lineTo(gx - 30, gy + 14); g.fill();
+  }
+  // Header.
+  g.textBaseline = "alphabetic"; g.textAlign = "left";
+  g.fillStyle = "#5fd0f0"; g.font = '700 30px "Silkscreen", monospace'; g.fillText("UNLIMITED KRILLION", 100, 130);
+  g.textAlign = "right"; g.fillStyle = "#8fb3c7"; g.font = '400 26px "Silkscreen", monospace';
+  g.fillText(kind === "catch" ? `PROMPT ${S.round} · ${fmt(depth).toUpperCase()}` : `${S.history.length} PROMPTS`, CARD_W - 100, 130);
+  g.textAlign = "center";
+  const cx = kind === "catch" ? CARD_W / 2 : (CARD_W - 60) / 2, maxW = CARD_W - 300;
+
+  if (kind === "catch") {
+    const h = S.history[S.history.length - 1], T = TIERS[h.tier], col = TIER_COL[h.tier];
+    const k = SINK_ORDER.indexOf(h.tier), line = pickLine(h);
+    // Centred "a  b" in two colours.
+    const pair = (a1, c1, a2, c2, y) => {
+      const w1 = g.measureText(a1).width, w2 = g.measureText(a2).width, x = cx - (w1 + w2) / 2;
+      g.textAlign = "left"; g.fillStyle = c1; g.fillText(a1, x, y); g.fillStyle = c2; g.fillText(a2, x + w1, y); g.textAlign = "center";
+    };
+    if (isBrag(h)) {
+      // BRAG: the answer is the hero, with proof of how rare it is and how deep it went.
+      g.font = '600 40px "JetBrains Mono", monospace';
+      const ql = wrapLines(g, h.q, maxW).slice(0, 3);
+      const off = Math.max(0, (CARD_H - 300 - (268 + (ql.length - 1) * 52 + 648)) / 2);   // centre the block above the footer
+      g.fillStyle = "#ff5c8a"; g.font = '400 26px "Silkscreen", monospace'; g.fillText(zoneFor(depth), cx, 210 + off);
+      g.fillStyle = "#c9e4f2"; g.font = '600 40px "JetBrains Mono", monospace';
+      ql.forEach((l, i) => g.fillText(l, cx, 268 + off + i * 52));
+      let y = 268 + off + (ql.length - 1) * 52 + 190;
+      g.save(); g.shadowColor = col; g.shadowBlur = 50; g.fillStyle = col;
+      fitFont(g, `“${h.a}”`, '700 #px "Silkscreen", monospace', 104, CARD_W - 220, 44); g.fillText(`“${h.a}”`, cx, y); g.restore();
+      y += 110;
+      const name = T.name.toUpperCase();
+      g.font = '700 56px "Silkscreen", monospace'; const nw = g.measureText(name).width, x0 = cx - (70 + 20 + nw) / 2;
+      g.save(); g.shadowColor = col; g.shadowBlur = 30; g.font = "62px serif"; g.textAlign = "center"; g.fillText(T.icon, x0 + 35, y + 4); g.restore();
+      g.textAlign = "left"; g.fillStyle = col; g.font = '700 56px "Silkscreen", monospace'; g.fillText(name, x0 + 90, y); g.textAlign = "center";
+      y += 82;
+      if (line && line.kind !== "common") {
+        g.fillStyle = "#ffcf5c"; fitFont(g, line.text, '600 #px "JetBrains Mono", monospace', 40, maxW, 26); g.fillText(line.text, cx, y);
+      } else {
+        g.fillStyle = "#8fb3c7"; fitFont(g, T.blurb, '400 #px "JetBrains Mono", monospace', 32, CARD_W - 200, 22); g.fillText(T.blurb, cx, y);
+      }
+      // rarity bar: six segments, lit down to the one you reached
+      y += 96;
+      const L = 150, W = CARD_W - 300, gap = 10, sw = (W - gap * 5) / 6;
+      SINK_ORDER.forEach((t, i) => {
+        const x = L + i * (sw + gap);
+        g.save(); g.globalAlpha = i <= k ? 1 : 0.22; g.fillStyle = TIER_COL[t];
+        if (i === k) { g.shadowColor = TIER_COL[t]; g.shadowBlur = 24; }
+        g.fillRect(x, y, sw, i === k ? 22 : 14);
+        g.restore();
+        g.save(); g.globalAlpha = i <= k ? 1 : 0.4; g.font = "32px serif"; g.fillText(TIERS[t].icon, x + sw / 2, y - 18); g.restore();
+      });
+      const hx = L + k * (sw + gap) + sw / 2;
+      g.fillStyle = col; g.font = '700 24px "Silkscreen", monospace'; g.fillText("▲ HERE", hx, y + 62);
+      g.fillStyle = "#8fb3c7"; g.font = '400 22px "Silkscreen", monospace';
+      g.textAlign = "left"; g.fillText("COMMON", L, y + 100); g.textAlign = "right"; g.fillText("RAREST", L + W, y + 100); g.textAlign = "center";
+      y += 170;
+      g.font = '600 40px "JetBrains Mono", monospace';
+      pair(`+${T.depth}m`, "#ff5c8a", `  ·  diving at ${fmt(depth)}`, "#e6f7ff", y);
+    } else {
+      // CHALLENGE: the prompt is the hook; my answer is the bar to beat, the deeper lines are locked.
+      g.fillStyle = "#ff5c8a"; g.font = '400 30px "Silkscreen", monospace'; g.fillText("CAN YOU GO DEEPER?", cx, 215);
+      g.fillStyle = "#e6f7ff"; g.font = '600 62px "JetBrains Mono", monospace';
+      const ql = wrapLines(g, h.q, maxW + 40).slice(0, 3); ql.forEach((l, i) => g.fillText(l, cx, 305 + i * 76));
+      let y = 305 + (ql.length - 1) * 76 + 100;
+      g.font = '600 42px "JetBrains Mono", monospace'; pair("I said ", "#8fb3c7", `“${h.a}”`, col, y);
+      y += 50;
+      g.fillStyle = "#8fb3c7"; g.font = '400 28px "JetBrains Mono", monospace';
+      g.fillText(line ? line.text.replace(" too", "") + "." : T.blurb, cx, y);
+      y += 80;
+      const L = 140, R = CARD_W - 140, ROW = Math.max(56, Math.min(78, (CARD_H - 300 - y) / 6));
+      SINK_ORDER.forEach((t, i) => {
+        const c2 = TIER_COL[t], Ti = TIERS[t], hit = i === k, deeper = i > k;
+        g.save(); g.globalAlpha = hit ? 1 : deeper ? 0.9 : 0.3;
+        g.strokeStyle = c2; g.lineWidth = hit ? 4 : 3; g.setLineDash(hit ? [] : [4, 8]);
+        if (hit) { g.shadowColor = c2; g.shadowBlur = 20; }
+        g.beginPath(); g.moveTo(L, y); g.lineTo(R, y); g.stroke(); g.restore();
+        g.save(); g.globalAlpha = hit || deeper ? 1 : 0.35;
+        const lbl = `${Ti.name.toUpperCase()} · +${Ti.depth}M`;
+        g.textAlign = "right"; g.fillStyle = c2; g.font = '400 22px "Silkscreen", monospace'; g.fillText(lbl, R, y + 34);
+        const lw = g.measureText(lbl).width; g.font = "26px serif"; g.fillText(Ti.icon, R - lw - 14, y + 36);
+        g.textAlign = "left";
+        if (hit) { g.fillStyle = c2; g.font = '700 24px "Silkscreen", monospace'; g.fillText(`◀ ME · “${h.a}”`.slice(0, 34), L, y + 34); }
+        else if (deeper) { g.fillStyle = "rgba(230,247,255,.6)"; g.font = '600 26px "JetBrains Mono", monospace'; g.fillText(t === "pearl" ? "? ? ?  (one hidden pearl)" : "? ? ?", L, y + 34); }
+        g.restore();
+        y += ROW;
+      });
+    }
+  } else {
+    g.fillStyle = "#ff5c8a"; g.font = '400 30px "Silkscreen", monospace'; g.fillText("OUT OF AIR", cx, 240);
+    g.save(); g.fillStyle = "#5fd0f0"; g.shadowColor = "#5fd0f0"; g.shadowBlur = 40;
+    fitFont(g, fmt(depth).toUpperCase(), '700 #px "Silkscreen", monospace', 190, maxW); g.fillText(fmt(depth).toUpperCase(), cx, 430); g.restore();
+    g.fillStyle = "#ffcf5c"; g.font = '400 36px "Silkscreen", monospace'; g.fillText(zoneFor(depth), cx, 500);
+    // Trail of tiers, wrapped.
+    const icons = S.history.map((h) => h.tier === "miss" ? "💀" : TIERS[h.tier].icon), per = 12, sz = 58;
+    const shown = icons.slice(0, per * 3);
+    g.font = `${sz - 10}px serif`;
+    shown.forEach((ic, i) => {
+      const row = Math.floor(i / per), n = Math.min(per, shown.length - row * per);
+      g.fillText(ic, cx - (n * sz) / 2 + (i % per) * sz + sz / 2, 600 + row * (sz + 6));
+    });
+    let y = 600 + Math.ceil(shown.length / per) * (sz + 6) + (icons.length > shown.length ? 10 : -10);
+    if (icons.length > shown.length) { g.fillStyle = "#8fb3c7"; g.font = '400 26px "JetBrains Mono", monospace'; g.fillText(`+${icons.length - shown.length} more`, cx, y); }
+    y += 70;
+    // Rarest catches.
+    const best = S.history.filter((h) => h.tier !== "miss").map((h, i) => ({ ...h, i }))
+      .sort((a, b) => RARITY.indexOf(b.tier) - RARITY.indexOf(a.tier) || a.i - b.i).slice(0, 3);
+    if (best.length) {
+      g.fillStyle = "#ffcf5c"; g.font = '700 26px "Silkscreen", monospace'; g.fillText("DEEPEST CATCHES", cx, y); y += 58;
+      best.forEach((h) => {
+        const T = TIERS[h.tier];
+        g.fillStyle = TIER_COL[h.tier]; fitFont(g, `${T.icon} “${h.a}”`, '600 #px "JetBrains Mono", monospace', 44, maxW); g.fillText(`${T.icon} “${h.a}”`, cx, y);
+        g.fillStyle = "#8fb3c7"; g.font = '400 24px "JetBrains Mono", monospace'; g.fillText(`${h.q.toLowerCase()} · ${T.name.toLowerCase()} +${T.depth}m`, cx, y + 36);
+        y += 100;
+      });
+    }
+  }
+  // Footer.
+  g.setLineDash([]); g.textAlign = "center";
+  g.strokeStyle = "rgba(95,208,240,.35)"; g.lineWidth = 2; g.beginPath(); g.moveTo(cx - 400, CARD_H - 230); g.lineTo(cx + 400, CARD_H - 230); g.stroke();
+  const last = kind === "catch" ? S.history[S.history.length - 1] : null;
+  const cta = !last ? "Can you sink deeper?" : last.tier === "pearl" ? "Found the pearl. Can you?" : isBrag(last) ? "Can you find a rarer one?" : "Your turn. Name a rarer one.";
+  g.fillStyle = "#e6f7ff"; g.font = '600 40px "JetBrains Mono", monospace'; g.fillText(cta, cx, CARD_H - 160);
+  g.fillStyle = "#5fd0f0"; g.font = '700 30px "Silkscreen", monospace'; g.fillText("UNLIMITED-KRILLION.ORG", cx, CARD_H - 108);
+  g.textAlign = "left"; g.fillStyle = "rgba(143,179,199,.8)"; g.font = '400 26px "JetBrains Mono", monospace'; g.fillText(`🤿 ${diverName()}`, 100, CARD_H - 72);
+  return new Promise((res) => c.toBlob(res, "image/png"));
+}
+function shareTextFor(kind) {
+  if (kind === "catch") {
+    const h = S.history[S.history.length - 1], T = TIERS[h.tier], line = pickLine(h);
+    if (isBrag(h)) return `${T.icon} "${h.a}" sank to ${T.name.toUpperCase()} on "${h.q}".` + (line && line.kind !== "common" ? ` ${line.text}.` : "") +
+      ` ${h.tier === "pearl" ? "Found the hidden pearl." : "Can you find a rarer one?"}\nhttps://unlimited-krillion.org/?ref=share-brag`;
+    return `"${h.q}": I said "${h.a}" ${T.icon} (${T.name}). Bet you can name a rarer one.\nhttps://unlimited-krillion.org/?ref=share-challenge`;
+  }
+  return `Unlimited Krillion 🏮 ${fmt(S.depth)} · ${zoneFor(S.depth)}\n${trail()}\nhttps://unlimited-krillion.org/?ref=share-${kind}`;
+}
+async function openShare(kind) {
+  if (!S) return;
+  const sheet = $("#shareSheet"), img = $("#ssImg");
+  if (img.src) URL.revokeObjectURL(img.src);
+  img.removeAttribute("src"); $("#ssLoad").hidden = false;
+  $("#ssHint").hidden = true;
+  sheet.hidden = false; S.sharing = true;
+  const last = S.history[S.history.length - 1];
+  if (kind === "catch" && last) await Promise.race([pickFor(last), new Promise((r) => setTimeout(r, 1500))]);
+  if (!S || $("#shareSheet").hidden) return;
+  const variant = kind === "catch" && last ? (isBrag(last) ? "brag" : "challenge") : kind;
+  shareData = { kind, text: shareTextFor(kind), blob: null };
+  track("share_open", { content_type: kind, variant, depth: Math.round(S.depth) });
+  const blob = await drawCard(kind);
+  if (!shareData || shareData.kind !== kind) return;
+  shareData.blob = blob;
+  img.src = URL.createObjectURL(blob); $("#ssLoad").hidden = true;
+  const file = new File([blob], `unlimited-krillion-${Math.round(S.depth)}m.png`, { type: "image/png" });
+  shareData.file = file;
+  // Native share only on touch devices: on desktop (esp. macOS) it often fails silently, and the
+  // "post to" row covers those users.
+  const touch = matchMedia("(pointer: coarse)").matches;
+  $("#ssShare").hidden = !(touch && navigator.canShare && navigator.canShare({ files: [file] }));
+  ($("#ssShare").hidden ? $("#ssSave") : $("#ssShare")).focus();
+}
+function closeShare() {
+  $("#shareSheet").hidden = true; shareData = null;
+  if (S) { S.sharing = false; if (S.state === "reveal") $("#nextBtn").focus(); }
+}
+const flashChip = (el, txt) => { const o = el.dataset.label || (el.dataset.label = el.textContent); el.textContent = txt; setTimeout(() => (el.textContent = o), 1800); };
+document.body.appendChild($("#shareSheet")); // escape the screens' stacking context so toasts stay underneath
+$("#rShare").onclick = () => openShare("catch");
+document.body.appendChild($("#reviveSheet"));
+$("#rvOk").onclick = doRevive;
+$("#rvShareGo").onclick = doShareRevive;
+document.querySelectorAll("#rvNets [data-rnet]").forEach((b) => (b.onclick = () => shareRevive(b.dataset.rnet)));
+$("#rvNo").onclick = declineRevive;
+$("#overShare").onclick = () => openShare("dive");
+$("#ssClose").onclick = closeShare;
+$("#shareSheet").onclick = (e) => { if (e.target.id === "shareSheet") closeShare(); };
+$("#ssShare").onclick = async () => {
+  if (!shareData || !shareData.file) return;
+  try { await navigator.share({ files: [shareData.file], text: shareData.text }); track("share", { method: "native", content_type: shareData.kind }); }
+  catch (e) { if (e && e.name !== "AbortError") { flashChip($("#ssShare"), "use save image"); track("share_error", { error: String(e.name || e) }); } }
+};
+$("#ssSave").onclick = () => {
+  if (!shareData || !shareData.blob) return;
+  const a = document.createElement("a"); a.href = URL.createObjectURL(shareData.blob); a.download = shareData.file.name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  track("share", { method: "download", content_type: shareData.kind });
+  flashChip($("#ssSave"), "saved!");
+};
+$("#ssCopy").onclick = async () => {
+  if (!shareData) return;
+  try { await navigator.clipboard.writeText(shareData.text); flashChip($("#ssCopy"), "copied!"); track("share", { method: "copy", content_type: shareData.kind }); }
+  catch { flashChip($("#ssCopy"), "copy failed"); }
+};
+// Social intents can only carry text + a link, so we also drop the card PNG on the clipboard
+// (where supported) and tell the player to paste it into the post.
+const SOCIAL = {
+  x: (t, u) => `https://x.com/intent/post?text=${encodeURIComponent(`${t}\n${u}`)}`,
+  bluesky: (t, u) => `https://bsky.app/intent/compose?text=${encodeURIComponent(`${t}\n${u}`)}`,
+  reddit: (t, u) => `https://www.reddit.com/submit?url=${encodeURIComponent(u)}&title=${encodeURIComponent(t.split("\n")[0])}`,
+  whatsapp: (t, u) => `https://wa.me/?text=${encodeURIComponent(`${t}\n${u}`)}`,
+  facebook: (t, u) => `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(u)}`,
+};
+document.querySelectorAll(".ss-social [data-net]").forEach((btn) => {
+  btn.onclick = () => {
+    if (!shareData) return;
+    const net = btn.dataset.net, i = shareData.text.lastIndexOf("\n");
+    const text = shareData.text.slice(0, i), url = shareData.text.slice(i + 1).replace(/(\?ref=[\w-]+)/, `$1-${net}`);
+    let copied = false;
+    if (shareData.blob && net !== "facebook" && navigator.clipboard && window.ClipboardItem) {
+      copied = true; // write must start inside the click, before the new tab steals focus
+      navigator.clipboard.write([new ClipboardItem({ "image/png": shareData.blob })]).catch(() => ($("#ssHint").hidden = true));
+    }
+    window.open(SOCIAL[net](text, url), "_blank", "noopener");
+    $("#ssHint").hidden = !copied;
+    track("share", { method: net, content_type: shareData.kind });
+  };
+});
+document.addEventListener("keydown", (e) => {
+  if (S && S.sharing) { if (e.key === "Escape") closeShare(); return; }
+  if (S && S.state === "revive") {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "d") $("#rvOk").textContent = "★ Bookmarked! Revive";
+    return;
+  }
+  if (e.key !== "Enter" || !S) return;
+  if (S.state === "sink") { e.preventDefault(); finishSink(); return; }
+  if (S.state === "reveal" && document.activeElement !== $("#answer")) { e.preventDefault(); nextPrompt(); }
+});
+addEventListener("resize", resize);
+
+document.body.classList.add("on-title");
+resize();
+buildGauge();
+refreshTitle();
+online.start();
+requestAnimationFrame(frame);
+
+// expose for debugging / tests
+window.__ld = { match, get PROMPTS() { return window.PROMPTS; }, TIERS, get state() { return S; } };
+})();

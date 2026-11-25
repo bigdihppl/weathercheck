@@ -1,0 +1,147 @@
+// Adsterra ad slots. One file for every page: include <script src="/ads.js" defer></script>.
+// Layout follows the "rails + adhesion" pattern:
+// - Side rails pinned to the screen edges on wide desktop screens; the page is inset so the game never sits under them.
+// - A sticky bottom banner (728x90 desktop / 320x50 phone); the page is lifted by its height.
+// - Game pages: a 300x250 on the game-over screen, refreshed every dive.
+// - Every page: a banner inside the article, native banner above the footer.
+// Each iframe banner gets its own srcdoc iframe so one unit's global `atOptions` can't clobber another's.
+// Slots only take up space once an ad has actually rendered in them; empty ones are removed.
+(() => {
+  const HOST = "https://bauval.org";
+  const UNITS = {
+    b300: { key: "6326a4e639f606178ed866b4bae5103c", w: 300, h: 250 },
+    b728: { key: "18f75f4d4746e5af98f442c1296ee1c2", w: 728, h: 90 },
+    b320: { key: "1773a2ae5c3af323e994051437905e04", w: 320, h: 50 },
+    // Create a 160x600 Banner in Adsterra and paste its key here: rails then show from 1200px wide instead of 1680px.
+    b160: { key: "95691997e5c9415b4f31273e4af053e6", w: 160, h: 600 },
+  };
+  const NATIVE = "5ed115c6e1c7e5c37e5f54cda3f9072d";
+  const RAIL_GAP = 10; // space between a rail ad and the screen edge / the game
+
+  const root = document.documentElement;
+  const finePointer = matchMedia("(hover: hover) and (pointer: fine)").matches;
+  const vw = () => window.innerWidth || root.clientWidth;
+  const vh = () => window.innerHeight || root.clientHeight;
+
+  const frame = (u) => {
+    const f = document.createElement("iframe");
+    f.width = u.w; f.height = u.h;
+    f.setAttribute("scrolling", "no");
+    f.setAttribute("frameborder", "0");
+    f.title = "Advertisement";
+    f.style.cssText = `display:block;border:0;width:${u.w}px;height:${u.h}px;margin:0 auto;`;
+    f.srcdoc = `<!doctype html><html><head><base target="_blank"><style>html,body{margin:0;padding:0;overflow:hidden;background:transparent}</style></head><body>`
+      + `<script>atOptions=${JSON.stringify({ key: u.key, format: "iframe", height: u.h, width: u.w, params: {} })};<\/script>`
+      + `<script src="${HOST}/22/${u.key}"><\/script></body></html>`;
+    return f;
+  };
+
+  // Polls the frame until the ad network has rendered something: onFill() once it has, onEmpty() if it never does.
+  const FILLED = "iframe, img, a, ins, video, canvas";
+  const watchFill = (f, onFill, onEmpty) => {
+    let n = 0;
+    const t = setInterval(() => {
+      let filled = false;
+      try { const d = f.contentDocument; filled = !!(d && d.body && d.body.querySelector(FILLED)); }
+      catch (e) { filled = true; /* cross-origin means something loaded */ }
+      if (filled) { clearInterval(t); onFill(); }
+      else if (++n >= 30) { clearInterval(t); onEmpty(); } // ~15s
+    }, 500);
+  };
+
+  // Slots stay invisible (but loading) until filled; empty ones are removed. Layout insets only apply to filled slots.
+  const slot = (cls, u, onFill, onEmpty) => {
+    const d = document.createElement("div");
+    d.className = "ad-slot ad-pending " + cls;
+    const f = frame(u);
+    d.appendChild(f);
+    watchFill(f,
+      () => { d.classList.remove("ad-pending"); if (onFill) onFill(d); },
+      () => { d.remove(); if (onEmpty) onEmpty(); });
+    return d;
+  };
+
+  function rails() {
+    if (!finePointer || vh() < 710) return;
+    const w = vw();
+    const u = UNITS.b160.key && w >= 1200 ? UNITS.b160 : (w >= 1680 ? UNITS.b300 : null);
+    if (!u) return;
+    root.style.setProperty("--ad-rail", u.w + RAIL_GAP * 2 + "px");
+    root.style.setProperty("--ad-rail-h", u.h + "px");
+    // Reserve both sides as soon as either rail fills, so the game stays centred.
+    const on = () => document.body.classList.add("has-rails");
+    document.body.appendChild(slot("ad-rail ad-rail-l", u, on));
+    document.body.appendChild(slot("ad-rail ad-rail-r", u, on));
+  }
+
+  function anchor() {
+    const u = vw() >= 768 ? UNITS.b728 : UNITS.b320;
+    root.style.setProperty("--ad-bottom", u.h + 8 + "px");
+    let s;
+    const close = () => { s.remove(); document.body.classList.remove("has-anchor"); };
+    s = slot("ad-anchor", u, () => document.body.classList.add("has-anchor"));
+    const x = document.createElement("button");
+    x.type = "button";
+    x.className = "ad-close";
+    x.setAttribute("aria-label", "Close ad");
+    x.textContent = "✕";
+    x.addEventListener("click", close);
+    s.appendChild(x);
+    document.body.appendChild(s);
+  }
+
+  // 300x250 under the game-over actions; reloaded each time a dive ends so every result screen is a fresh impression.
+  function overSlot() {
+    const over = document.getElementById("screen-over");
+    const after = over && over.querySelector(".o-actions");
+    if (!after) return;
+    let box = null;
+    const refresh = () => {
+      if (!over.classList.contains("active")) return;
+      const next = slot("ad-over", UNITS.b300);
+      if (box) box.replaceWith(next); else after.after(next);
+      box = next;
+    };
+    new MutationObserver(refresh).observe(over, { attributes: true, attributeFilter: ["class"] });
+    refresh();
+  }
+
+  function inArticle() {
+    const guide = document.getElementById("guide");
+    const u = (guide ? guide.clientWidth : vw()) >= 760 ? UNITS.b728 : UNITS.b320;
+    const s = slot("ad-inline", u);
+    const first = guide && guide.querySelector(":scope > section");
+    if (first) first.after(s);
+    else if (guide) guide.prepend(s);
+    else {
+      const foot = document.getElementById("foot");
+      if (foot) foot.before(s);
+    }
+  }
+
+  function native() {
+    const foot = document.getElementById("foot");
+    if (!foot) return;
+    const d = document.createElement("div");
+    d.className = "ad-slot ad-native";
+    const c = document.createElement("div");
+    c.id = "container-" + NATIVE;
+    d.appendChild(c);
+    foot.before(d);
+    const s = document.createElement("script");
+    s.async = true;
+    s.setAttribute("data-cfasync", "false");
+    s.src = `${HOST}/21/${NATIVE}`;
+    d.appendChild(s);
+  }
+
+  function init() {
+    const game = !!document.getElementById("screen-title");
+    if (game) { rails(); overSlot(); }
+    anchor();
+    inArticle();
+    native();
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
+})();
